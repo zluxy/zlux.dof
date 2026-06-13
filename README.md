@@ -6,7 +6,7 @@
 
 *Vogel-spiral bokeh engine · vintage glass soul · single-file install*
 
-![Version](https://img.shields.io/badge/version-2.14.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey) ![Host](https://img.shields.io/badge/After%20Effects-2022%2B-9999ff) ![License](https://img.shields.io/badge/license-Freeware-green)
+![Version](https://img.shields.io/badge/version-2.15.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey) ![Host](https://img.shields.io/badge/After%20Effects-2022%2B-9999ff) ![License](https://img.shields.io/badge/license-Freeware-green)
 
 <!-- PLACEHOLDER: hero shot — best-looking frame, heavy bokeh, point lights -->
 ![zluxDOF hero](docs/img/hero.png)
@@ -31,7 +31,7 @@ Feed it any depth map — AI-generated (Depth Anything / MiDaS), a 3D render Z-p
 ## Highlights
 
 ### 🔭 Real lens presets
-14 one-click lenses, each modeled on the documented optical character of the actual glass — and every preset **bakes into the sliders**, so it's a starting point you can edit, not a black box:
+19 one-click lenses, each modeled on the documented optical character of the actual glass — and every preset **bakes into the sliders**, so it's a starting point you can edit, not a black box:
 
 | Preset | Character |
 |---|---|
@@ -47,6 +47,9 @@ Feed it any depth map — AI-generated (Depth Anything / MiDaS), a 3D render Z-p
 | **Wide Macro Rig (Psyche)** | the psychedelic franken-rig look |
 | **Sigma 105mm f/1.4 Art** | the modern clinical reference |
 | **LOMO 35-NAP 2x / Laowa Nanomorph 1.5x** | true anamorphic ovals & fringe |
+| **Swirl-o-Tron 58 (Vortex)** | astigmatism cranked into a hypnotic full-frame vortex |
+| **Starburst Zoom 35** | radial zoom-burst streaks + glowing field-curvature edges |
+| **Anamorphic Comet 2x** | 2× squeeze sheared into leaning comet-streak bokeh |
 
 <!-- PLACEHOLDER: 3-4 preset comparison grid on the same shot -->
 ![Lens presets](docs/img/presets_grid.png)
