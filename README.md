@@ -6,7 +6,7 @@
 
 *Vogel-spiral bokeh engine · vintage glass soul · single-file install*
 
-![Version](https://img.shields.io/badge/version-2.15.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey) ![Host](https://img.shields.io/badge/After%20Effects-2022%2B-9999ff) ![License](https://img.shields.io/badge/license-Freeware-green)
+![Version](https://img.shields.io/badge/version-2.15.1-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey) ![Host](https://img.shields.io/badge/After%20Effects-2022%2B-9999ff) ![License](https://img.shields.io/badge/license-Freeware-green)
 
 <!-- PLACEHOLDER: hero shot — best-looking frame, heavy bokeh, point lights -->
 ![zluxDOF hero](docs/img/hero.png)
