@@ -1,6 +1,6 @@
-# zluxDOF — Patch Log
+# zluxDOF — Changelog
 
-## v2.23 — CUDA gather
+## v2.28.0 — CUDA gather
 
 **9.0× faster per frame.** The depth-of-field gather now runs on the GPU.
 
@@ -137,7 +137,7 @@ Effects loads for itself.
 
 ## Earlier
 
-Version history before v2.23 was not tracked in this file.
+Version history before v2.28.0 was not tracked in this file.
 
 ---
 
