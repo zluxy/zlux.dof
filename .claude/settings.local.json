@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d C:/Users/zlux/Desktop/**)",
+      "Bash(build.bat)",
+      "Bash(cmd /c \"cd /d C:\\\\Users\\\\zlux\\\\Desktop\\\\zluxDOF && build.bat\")",
+      "Bash(cmd /c \"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat && cd /d C:\\\\Users\\\\zlux\\\\Desktop\\\\zluxDOF\\\\zluxDOF\\\\Win && msbuild zluxDOF.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /verbosity:minimal\")",
+      "Bash(powershell -Command \"& 'C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\Common7\\\\Tools\\\\VsMSBuildCmd.bat'; cd 'C:\\\\Users\\\\zlux\\\\Desktop\\\\zluxDOF\\\\zluxDOF\\\\Win'; msbuild zluxDOF.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /verbosity:minimal\")",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/BuildTools/MSBuild/Current/Bin/MSBuild.exe\" \"C:/Users/zlux/Desktop/zluxDOF/zluxDOF/Win/zluxDOF.vcxproj\" /t:Rebuild /p:Configuration=Release /p:Platform=x64 /verbosity:minimal)",
+      "Bash(echo \"Total documentation: $\\(find . -name \"*.md\")",
+      "Bash(cmd *)",
+      "Bash(\"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" zluxDOF.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /verbosity:minimal)",
+      "Bash(\"C:\\\\Program Files \\(x86\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe\" zluxDOF.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /v:m)",
+      "Bash(powershell *)",
+      "mcp__Claude_in_Chrome__tabs_context_mcp"
+    ]
+  }
+}
