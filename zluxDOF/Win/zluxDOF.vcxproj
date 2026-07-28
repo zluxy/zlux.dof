@@ -183,7 +183,17 @@
       <WholeProgramOptimization>true</WholeProgramOptimization>
       <OpenMPSupport>true</OpenMPSupport>
       <AdditionalIncludeDirectories>..\..\AfterEffectsSDK\Examples\Headers;..\..\AfterEffectsSDK\Examples\Headers\SP;..\..\AfterEffectsSDK\Examples\Headers\Win;..\..\AfterEffectsSDK\Examples\Resources;..\..\AfterEffectsSDK\Examples\Util;$(CUDA_SDK_BASE_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <!-- STATIC CRT, deliberately.
+           After Effects ships MSVCP140.dll / VCRUNTIME140.dll version 14.23
+           (VS 2019) in Support Files, right next to AfterFX.exe. The EXE's
+           folder wins the DLL search, so a plug-in built with a newer toolset
+           binds to that old runtime. The MSVC runtime is backward compatible
+           but NOT forward compatible: this plug-in is built with 14.44, and
+           against 14.23 the thread-safe-static machinery
+           (_Init_thread_footer -> MSVCP140) read a null and took AE down.
+           Confirmed from an AE minidump. Linking the CRT statically means the
+           plug-in never touches AE's copy. -->
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <StructMemberAlignment>Default</StructMemberAlignment>
       <RuntimeTypeInfo>true</RuntimeTypeInfo>
       <PrecompiledHeader>
@@ -229,7 +239,14 @@
            GPU-accelerated plugins installed on this machine already do. -->
       <!-- Only cudart here: MSBuild already feeds the CustomBuild output object
            to the linker, and naming it again produces LNK4042. -->
-      <AdditionalDependencies>cudart.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>cudart.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- Delay-load the CUDA runtime. With a hard import, a machine without
+           cudart64_12.dll cannot map the plug-in at all, so After Effects stops
+           listing the effect entirely: users with no NVIDIA GPU would lose
+           zluxDOF rather than fall back to the CPU renderer. Delay-loading means
+           nothing is resolved until the first CUDA call, and the code probes for
+           the runtime (CudaRuntimePresent) before making one. -->
+      <DelayLoadDLLs>cudart64_12.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
       <AdditionalLibraryDirectories>$(CUDA_SDK_BASE_PATH)\lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <Bscmake>
@@ -305,7 +322,17 @@
       <Optimization>MaxSpeed</Optimization>
       <OpenMPSupport>true</OpenMPSupport>
       <AdditionalIncludeDirectories>..\..\AfterEffectsSDK\Examples\Headers;..\..\AfterEffectsSDK\Examples\Headers\SP;..\..\AfterEffectsSDK\Examples\Headers\Win;..\..\AfterEffectsSDK\Examples\Resources;..\..\AfterEffectsSDK\Examples\Util;$(CUDA_SDK_BASE_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <!-- STATIC CRT, deliberately.
+           After Effects ships MSVCP140.dll / VCRUNTIME140.dll version 14.23
+           (VS 2019) in Support Files, right next to AfterFX.exe. The EXE's
+           folder wins the DLL search, so a plug-in built with a newer toolset
+           binds to that old runtime. The MSVC runtime is backward compatible
+           but NOT forward compatible: this plug-in is built with 14.44, and
+           against 14.23 the thread-safe-static machinery
+           (_Init_thread_footer -> MSVCP140) read a null and took AE down.
+           Confirmed from an AE minidump. Linking the CRT statically means the
+           plug-in never touches AE's copy. -->
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <StructMemberAlignment>Default</StructMemberAlignment>
       <RuntimeTypeInfo>true</RuntimeTypeInfo>
       <PrecompiledHeader>
@@ -360,7 +387,9 @@ cl /D "MSWindows" /EP $(IntDir)%(Filename).rrc &gt;               "$(ProjectDir)
 cl /D "MSWindows" /EP $(IntDir)%(Filename).rrc &gt;               "$(ProjectDir)"\\"%(Filename)".rc
 </Command>
       <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">$(ProjectDir)%(Filename).rc;%(Outputs)</Outputs>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">..\zluxDOF_Version.h;%(AdditionalInputs)</AdditionalInputs>
       <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">$(ProjectDir)%(Filename).rc;%(Outputs)</Outputs>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">..\zluxDOF_Version.h;%(AdditionalInputs)</AdditionalInputs>
       <Message Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Compiling the PiPL</Message>
       <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Compiling the PiPL</Message>
       <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">cl /I "$(ProjectDir)..\..\AfterEffectsSDK\Examples\Headers" /EP ".."\\"%(Filename).r" &gt; "$(IntDir)"\\"%(Filename).rr"
@@ -372,7 +401,9 @@ cl /D "MSWindows" /EP $(IntDir)%(Filename).rrc &gt;               "$(ProjectDir)
 cl /D "MSWindows" /EP $(IntDir)%(Filename).rrc &gt;               "$(ProjectDir)"\\"%(Filename)".rc
 </Command>
       <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)%(Filename).rc;%(Outputs)</Outputs>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">..\zluxDOF_Version.h;%(AdditionalInputs)</AdditionalInputs>
       <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)%(Filename).rc;%(Outputs)</Outputs>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">..\zluxDOF_Version.h;%(AdditionalInputs)</AdditionalInputs>
     </CustomBuild>
   </ItemGroup>
   <ItemGroup>
@@ -404,7 +435,7 @@ cl /D "MSWindows" /EP $(IntDir)%(Filename).rrc &gt;               "$(ProjectDir)
   </ItemGroup>
   <ItemGroup>
     <!-- CUDA gather kernel. nvcc emits an .obj that the linker picks up through
-         AdditionalDependencies above. -Xcompiler /MD is REQUIRED: nvcc defaults
+         AdditionalDependencies above. -Xcompiler /MT is REQUIRED: nvcc defaults
          to /MT and the mismatch fails the link with LNK2038.
          zluxDOF is distributed publicly, so the kernel ships as a fat binary
          covering every architecture CUDA 13.x supports:
@@ -419,7 +450,33 @@ cl /D "MSWindows" /EP $(IntDir)%(Filename).rrc &gt;               "$(ProjectDir)
          (GTX 10xx) users get the CPU path; moving to CUDA 12.9 would cover them. -->
     <CustomBuild Include="..\zluxDOF_Kernel.cu">
       <FileType>Document</FileType>
-      <Command>"$(CUDA_SDK_BASE_PATH)\bin\nvcc.exe" -c "%(FullPath)" -o "$(IntDir)zluxDOF_Kernel.obj" --use-local-env -O3 -m64 -std=c++17 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120 -Xcompiler /MD</Command>
+      <!-- Build against CUDA 12.9. CUDA 13 CANNOT be used here: its runtime
+           initialises through a "hybrid runtime loader" (nvcudart_hybrid64.dll
+           from the driver store) which access-violates on the very first
+           cudaGetDeviceCount inside After Effects, where cudart64_110.dll,
+           nvcuda.dll and REDCuda-x64.dll are already loaded. Confirmed from an
+           AE minidump: read of 0x0 in MSVCP140, stack RunGather to Ctx() magic
+           static to initializeLoader to initializeHybridRuntimeLoaderOnce to
+           cudaGetDeviceCount. And there is no escape inside CUDA 13: dumpbin
+           shows both cudart.lib and cudart_static.lib carry that loader and
+           neither carries __imp_ stubs, so "cudart shared" changes nothing.
+
+           CUDA 12.9's cudart.lib is a real import library for cudart64_12.dll,
+           which build.bat copies next to AfterFX.exe (a plug-in's own folder is
+           not on the DLL search path).
+
+           Architectures: 12.9 reaches back to sm_50, so the freeware build
+           covers Maxwell through Blackwell, plus compute_120 PTX so future
+           cards JIT rather than falling back to the CPU.
+             sm_50/52 Maxwell   GTX 9xx
+             sm_60/61 Pascal    GTX 10xx
+             sm_70    Volta     Titan V
+             sm_75    Turing    RTX 20xx, GTX 16xx
+             sm_80/86 Ampere    A100, RTX 30xx
+             sm_89    Ada       RTX 40xx
+             sm_90    Hopper    H100
+             sm_120   Blackwell RTX 50xx -->
+      <Command>"$(CUDA_SDK_BASE_PATH)\bin\nvcc.exe" -c "%(FullPath)" -o "$(IntDir)zluxDOF_Kernel.obj" --use-local-env -O3 -m64 -std=c++17 -cudart shared -gencode arch=compute_50,code=sm_50 -gencode arch=compute_52,code=sm_52 -gencode arch=compute_60,code=sm_60 -gencode arch=compute_61,code=sm_61 -gencode arch=compute_70,code=sm_70 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120 -Xcompiler /MT</Command>
       <Outputs>$(IntDir)zluxDOF_Kernel.obj</Outputs>
       <Message>nvcc zluxDOF_Kernel.cu (sm_120)</Message>
     </CustomBuild>

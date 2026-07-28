@@ -1,6 +1,6 @@
 # zluxDOF — Changelog
 
-## v2.28.0 — CUDA gather
+## v3.0.0 — CUDA gather
 
 **9.0× faster per frame.** The depth-of-field gather now runs on the GPU.
 
@@ -31,6 +31,54 @@ ZLUX_REPEAT=6 ZLUX_SAMPLES=256 ZLUX_RMODE=2 ./dof_png.exe bench_photo.raw bench_
 `ZLUX_NOGPU=1` forces the CPU gather and produces the reference image.
 `ZLUX_REPEAT=N` matters: a single frame measures cold start (CUDA context
 creation alone is 70–105 ms) and understates the result by roughly half.
+
+### Preservative Highlights (new)
+
+`Highlights / Bokeh Shaping > Highlight Mode` selects how Highlight Scatter
+combines with the gather.
+
+- **Additive** — the previous behaviour. Specular taps accumulate into an
+  un-normalised bucket layered on top of the gather, so a bright point can push
+  the result past the source's own peak and clip to flat white.
+- **Preservative** — the specular emphasis is folded into the gather *weights*
+  and renormalised. The result stays a convex combination of the sampled
+  colours, so it can never exceed the brightest sample: exposure and dynamic
+  range are conserved and the highlight is concentrated by redistributing energy
+  rather than inventing it.
+
+Measured on a synthetic scene of 45 bright point sources at blur 55:
+
+| mode | mean | clipped pixels | peak |
+|---|---:|---:|---:|
+| scatter off | 19.34 | 0 | 232 |
+| Additive | 19.88 | **398** | **255** (clipped) |
+| Preservative | **21.13** | **0** | 247 |
+
+Preservative reads *brighter* than additive while clipping nothing — the
+highlights are more present, and the frame never blows out.
+
+This closes the last feature gap against DOF PRO v2.0.
+
+### Also in this release
+
+- Astigmatism, the anisotropic multi-tap, the custom aperture texture and the
+  iris modulator layer all run on the GPU now. Previously each of them silently
+  forced the whole frame onto the CPU gather, which is 10-20x slower: astigmatism
+  alone went from 1409 ms to 82 ms per frame.
+- The CoC-discontinuity distance field moved to a jump-flooding transform on the
+  GPU (13.7 ms -> 0.1 ms). The CPU version was two sequential chamfer sweeps that
+  could not be threaded at all.
+- The per-pixel gather radii are computed on the device, removing three
+  full-frame uploads per frame.
+- GPU buffers are grow-only and the CUDA context is released on unload. The old
+  free/realloc on every resolution change churned ~270 MB per switch, including
+  pinned host memory, which could make After Effects report "GPU out of memory"
+  for effects that were not even ours (seen on adjustment layers).
+- The CUDA runtime is delay-loaded and ships beside the plug-in. A machine with
+  no CUDA runtime now gets a working CPU plug-in instead of one Windows refuses
+  to map, which previously removed zluxDOF from the effect list entirely.
+- The panel banner shows a **GPU** / **CPU** badge with the last blur time, so a
+  fallback to the CPU path is visible rather than merely slow.
 
 ### Output parity
 
@@ -137,7 +185,7 @@ Effects loads for itself.
 
 ## Earlier
 
-Version history before v2.28.0 was not tracked in this file.
+Version history before v3.0.0 was not tracked in this file.
 
 ---
 
@@ -161,3 +209,46 @@ resident in L2 and the prefetcher hides it entirely; and float storage adds a
 The useful part was the diagnosis: the gather is bound by **random access** — the
 mip fetches and the scattered CoC reads — which is precisely what the CUDA port
 addresses and what no CPU data-layout change could.
+
+---
+
+## Version-field overflow (fixed in v3.0.0)
+
+`MINOR_VERSION` had been above 15 since v2.16, which silently broke AE's version
+handshake. AE packs the version into fixed bit fields (`PF_Vers_*` in
+`AE_Effect.h`), and `subvers` is only 4 bits:
+
+| field | bits | max |
+|---|---|---:|
+| build | 0-8 | 511 |
+| stage | 9-10 | 3 |
+| bugfix | 11-14 | 15 |
+| **subvers (minor)** | **15-18** | **15** |
+| vers (major) | 19-21 | 7 |
+
+The two encodings then disagreed about the overflow. `PF_VERSION()` masks each
+field, so a minor of 28 became `28 & 0xF == 12`. `ZLUX_PIPL_VERSION` is plain
+arithmetic, so `28 * 32768` carried into the major field instead. Result:
+
+```
+After Effects: effect "zluxDOF" has version mismatch.
+Code version is 2.12 and PiPL version is 3.12. (160001)
+```
+
+The header's promise that the two "can never drift apart" only held for
+`MINOR_VERSION <= 15`.
+
+Fixed by moving to 3.0.0 (major bump, minor reset) and by adding `static_assert`s
+in `zluxDOF.cpp` that check every field against its width and, most importantly,
+assert `ZLUX_PIPL_VERSION == PF_VERSION(...)`. A future overflow now fails the
+build instead of shipping.
+
+Also fixed alongside it:
+
+- The PiPL `CustomBuild` step listed only `zluxDOFPiPL.r` as an input, so bumping
+  `zluxDOF_Version.h` did not regenerate the resource on an incremental build.
+  `zluxDOF_Version.h` is now in `AdditionalInputs` for all four configurations.
+- `build.bat` installed to `Common\Plug-ins\7.0\MediaCore\zlux` while the plugin
+  was also present in `Support Files\Plug-ins\zlux`. AE scans both recursively,
+  so two builds of the same effect could be registered at once. It now installs
+  to one location only.

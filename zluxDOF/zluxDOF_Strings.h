@@ -56,6 +56,8 @@ typedef enum {
 	StrID_Highlights_Enhancement,
 	StrID_Highlights_BokehGamma,
 	StrID_Highlights_Scatter,
+	StrID_Highlights_Mode,
+	StrID_Highlights_Mode_Choices,
 	StrID_Highlights_Recovery,
 	StrID_Highlights_Tint,
 	StrID_ApTex_Group,

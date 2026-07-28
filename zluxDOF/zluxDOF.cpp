@@ -1,5 +1,27 @@
 #include "zluxDOF.h"
 
+// ── Version-field guards ────────────────────────────────────────────────────
+// AE packs the version into fixed-width bit fields, and the two places that
+// encode it disagree on overflow: PF_VERSION() masks, while the PiPL's
+// ZLUX_PIPL_VERSION is plain arithmetic that carries into the next field. A
+// MINOR_VERSION of 28 therefore shipped as "code 2.12 / PiPL 3.12" and AE threw
+// a version-mismatch dialog. Fail the build instead of shipping that again.
+static_assert(MAJOR_VERSION >= 0 && MAJOR_VERSION <= 7,
+              "MAJOR_VERSION must fit PF_Vers_VERS_BITS (0..7)");
+static_assert(MINOR_VERSION >= 0 && MINOR_VERSION <= 15,
+              "MINOR_VERSION must fit PF_Vers_SUBVERS_BITS (0..15) -- bump MAJOR and reset MINOR to 0");
+static_assert(BUG_VERSION >= 0 && BUG_VERSION <= 15,
+              "BUG_VERSION must fit PF_Vers_BUGFIX_BITS (0..15)");
+static_assert(BUILD_VERSION >= 0 && BUILD_VERSION <= 511,
+              "BUILD_VERSION must fit PF_Vers_BUILD_BITS (0..511)");
+static_assert(ZLUX_STAGE_NUM >= 0 && ZLUX_STAGE_NUM <= 3,
+              "ZLUX_STAGE_NUM must fit PF_Vers_STAGE_BITS (0..3)");
+// The whole point: the arithmetic the PiPL uses must equal what the code
+// reports, or AE compares the two and refuses to load cleanly.
+static_assert(ZLUX_PIPL_VERSION ==
+              PF_VERSION(MAJOR_VERSION, MINOR_VERSION, BUG_VERSION, ZLUX_STAGE_NUM, BUILD_VERSION),
+              "ZLUX_PIPL_VERSION and PF_VERSION() disagree -- a version field has overflowed");
+
 // CUDA gather. Defined when the build links zluxDOF_Kernel.cu; without it the
 // renderer compiles and runs exactly as before on the CPU path.
 #ifdef ZLUX_CUDA
@@ -15,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -580,6 +603,10 @@ struct DOFSettings {
 	// through defocus instead of being averaged away, producing the
 	// plump cinematic bokeh shape with a bright iris edge.
 	PF_FpLong highlight_scatter;
+	// 0 = Additive (un-normalised sprite layered on top, can clip),
+	// 1 = Preservative (specular emphasis folded into the gather weights and
+	// renormalised, so exposure and dynamic range are conserved).
+	A_long highlight_mode;
 	// Highlight clipping recovery: at capture time, 8/16bpc sources clamp
 	// saturated specular peaks to 1.0 and lose the real HDR energy that
 	// would otherwise give bokeh its DOF PRO punch. When this slider is
@@ -2903,6 +2930,15 @@ PassOutput GatherPass(
 	// via the new Highlight Scatter slider; at 0 the whole path compiles out
 	// to a couple of floats doing nothing.
 	const bool has_scatter = s.highlight_scatter > 0.001;
+	// Preservative mode folds the specular emphasis into the gather WEIGHTS
+	// instead of layering an un-normalised bucket on top. Because the result
+	// stays Sigma(col*w)/Sigma(w), it is a convex combination of the sampled
+	// colours: it can never exceed the brightest sample, so a bright point
+	// source concentrates into a crisp iris without pushing the frame past its
+	// own peak and clipping to flat white. Energy is redistributed, not added.
+	const bool preservative = has_scatter && (s.highlight_mode == 1);
+	const bool additive_scatter = has_scatter && !preservative;
+	constexpr PF_FpLong kPreserveGain = 8.0;
 	Color3 spec_acc{0.0, 0.0, 0.0};
 
 	for (A_long i = 0; i < actual_N; ++i) {
@@ -3173,6 +3209,13 @@ PassOutput GatherPass(
 			w *= s.bokeh_gamma_lut[li] * (1.0 - lt) + s.bokeh_gamma_lut[li + 1] * lt;
 		}
 
+		if (preservative) {
+			// Same specular test as the additive path, but it scales the tap's
+			// weight rather than feeding a separate accumulator.
+			const PF_FpLong sf = ComputeHighlightMask(col, s);
+			if (sf > 0.001) w *= 1.0 + s.highlight_scatter * kPreserveGain * sf;
+		}
+
 		acc.r += col.r * w;
 		acc.g += col.g * w;
 		acc.b += col.b * w;
@@ -3195,7 +3238,7 @@ PassOutput GatherPass(
 		// above-threshold samples contribute. Darks are not touched, so
 		// the additive layer never brightens mid-tones -- only the sample
 		// positions that the user considers "specular" splat into spec_acc.
-		if (has_scatter) {
+		if (additive_scatter) {
 			const PF_FpLong spec_factor = ComputeHighlightMask(col, s);
 			if (spec_factor > 0.001) {
 				const PF_FpLong sw = mask * gate * spec_factor;
@@ -3263,7 +3306,7 @@ PassOutput GatherPass(
 	} else {
 		matte = 0.0;
 	}
-	if (has_scatter) {
+	if (additive_scatter) {
 		// Normalise by actual sample count so the sprite layer is
 		// independent of the Vogel LUT picked at this pixel (64 vs 1024
 		// sample counts give the same visual intensity). At slider = 1
@@ -3796,6 +3839,36 @@ inline PF_FpLong ProbeFarReachWide(const float* coc, A_long w, A_long h,
 	return c_max;
 }
 
+
+#ifdef ZLUX_CUDA
+// Folds an aperture layer to a single-channel luma image for the device.
+// Luma is a linear combination of RGB and bilinear filtering is linear, so
+// luma-then-filter equals filter-then-luma exactly -- doing it here costs one
+// pass over a small layer and saves three quarters of the per-tap bandwidth.
+template <typename PIX>
+static void ApertureLayerToLumaTyped(const PF_EffectWorld* w, std::vector<float>& out)
+{
+	out.resize(static_cast<size_t>(w->width) * w->height);
+	ParallelRows(w->height, 32, [&](A_long y0, A_long y1) {
+		for (A_long y = y0; y < y1; ++y) {
+			for (A_long x = 0; x < w->width; ++x) {
+				const Color3 c = ColorFromPix(*PixelPtr<PIX>(w, x, y));
+				out[static_cast<size_t>(y) * w->width + x] = static_cast<float>(Luma(c));
+			}
+		}
+	});
+}
+
+static bool ApertureLayerToLuma(const PF_EffectWorld* w, std::vector<float>& out)
+{
+	if (!w || !w->data || w->width <= 0 || w->height <= 0) return false;
+	if (PF_WORLD_IS_DEEP(const_cast<PF_EffectWorld*>(w)))      ApertureLayerToLumaTyped<PF_Pixel16>(w, out);
+	else if (WorldIsFloat(w))                                  ApertureLayerToLumaTyped<PF_PixelFloat>(w, out);
+	else                                                       ApertureLayerToLumaTyped<PF_Pixel8>(w, out);
+	return true;
+}
+#endif
+
 // ── GPU gather bridge ───────────────────────────────────────────────────────
 //
 // Materialises the per-pixel gather radii, flattens the pyramid / Vogel ladder
@@ -3807,14 +3880,112 @@ struct float4_gpu { float x, y, z, w; };
 
 namespace zlux_gpu {
 
+// ── Which path actually ran, for the panel badge ────────────────────────────
+// Whether the gather ran on the GPU has been invisible to the user, and that
+// ambiguity has already caused a "it feels faster" report while the GPU path
+// was in fact disabled. RenderCore records what it really did; the custom-UI
+// banner reads it. Deliberately reports the OBSERVED path, not the configured
+// one, so a silent CPU fallback (unsupported feature, unhealthy device) is
+// visible rather than merely slow.
+enum class Path : int { Unknown = 0, Cpu = 1, Gpu = 2 };
+
+inline std::atomic<int>& LastPath()
+{
+	static std::atomic<int> p{static_cast<int>(Path::Unknown)};
+	return p;
+}
+
+// Last gather-stage wall time in milliseconds (kernel + transfers, or the CPU
+// gather). Written by RenderCore, read by the badge.
+inline std::atomic<float>& LastGatherMs()
+{
+	static std::atomic<float> ms{0.0f};
+	return ms;
+}
+
+inline void RecordPath(Path p, float ms)
+{
+	LastPath().store(static_cast<int>(p), std::memory_order_relaxed);
+	LastGatherMs().store(ms, std::memory_order_relaxed);
+}
+
+
 #ifdef ZLUX_CUDA
-// Opt-out rather than opt-in: the GPU path is the default whenever the device
-// and the settings support it. ZLUX_NOGPU forces the CPU gather, which is what
-// the verification harness uses to produce the reference image.
+// ── GPU path gate ───────────────────────────────────────────────────────────
+//
+// ── CUDA runtime availability ───────────────────────────────────────────────
+//
+// cudart is DELAY-LOADED (see /DELAYLOAD in zluxDOF.vcxproj), so no CUDA symbol
+// is resolved until the first call. That matters because a hard import means the
+// Windows loader refuses to map the plug-in at all when the DLL is absent, and
+// After Effects then does not list the effect -- a user with no CUDA toolkit
+// would lose zluxDOF entirely instead of falling back to the CPU renderer.
+//
+// So: try to load the runtime ourselves, first from the folder the .aex lives in
+// (which is NOT on the DLL search path, but is where the DLL ships next to the
+// plug-in), then from the default search order. If neither works, no CUDA call
+// is ever made and the CPU path runs exactly as it always did.
+inline bool CudaRuntimePresent()
+{
+	static const bool ok = []() -> bool {
+		// Already mapped? A host that links cudart normally (the dof_png harness)
+		// or an earlier probe has it in the process already, and asking the
+		// loader to find it again BY NAME fails whenever the CUDA bin directory
+		// is not on PATH -- which is exactly what silently disabled the GPU path
+		// here after delay-loading was introduced.
+		if (::GetModuleHandleW(L"cudart64_12.dll")) return true;
+
+		// Next to the .aex: where the runtime ships, and NOT on the DLL search
+		// path, so it needs an explicit full path.
+		wchar_t dir[MAX_PATH] = {0};
+		if (::GetModuleFileNameW(zlux_banner::GetPluginModule(), dir, MAX_PATH)) {
+			if (wchar_t* slash = wcsrchr(dir, L'\\')) {
+				*(slash + 1) = 0;
+				std::wstring beside = std::wstring(dir) + L"cudart64_12.dll";
+				if (::LoadLibraryExW(beside.c_str(), nullptr,
+				                     LOAD_WITH_ALTERED_SEARCH_PATH)) return true;
+			}
+		}
+		return ::LoadLibraryW(L"cudart64_12.dll") != nullptr;
+	}();
+	return ok;
+}
+
+// ON by default. The AE crash that prompted a temporary opt-in default was
+// traced to the version-field overflow (code 2.12 vs PiPL 3.12) plus a duplicate
+// .aex registered from two plug-in folders -- not to CUDA. Both are fixed, and
+// the failure latch below covers a genuinely unhealthy device.
+//
+//   ZLUX_NOGPU=1   force the CPU gather (also how the harness renders the
+//                  reference image the GPU output is diffed against)
+//
+// Built against CUDA 12.9, whose cudart.lib is a genuine import library for
+// cudart64_12.dll. CUDA 13 must NOT be used: both of its libs route through a
+// hybrid runtime loader that access-violates on the first cudaGetDeviceCount
+// inside After Effects (minidump: read of 0x0 in MSVCP140, stack RunGather ->
+// Ctx() -> initializeLoader -> initializeHybridRuntimeLoaderOnce).
+//
+// Note the short-circuit order: ZLUX_NOGPU is checked before
+// zluxGpuAvailable(), so forcing the CPU path also means the CUDA runtime is
+// never initialised at all.
 inline bool Enabled()
 {
-	static const bool v = (std::getenv("ZLUX_NOGPU") == nullptr) && (zluxGpuAvailable() != 0);
+	// Order matters twice over: ZLUX_NOGPU short-circuits before anything CUDA
+	// happens, and CudaRuntimePresent() must succeed before zluxGpuAvailable()
+	// touches a delay-loaded import.
+	static const bool v = (std::getenv("ZLUX_NOGPU") == nullptr) &&
+	                      CudaRuntimePresent() &&
+	                      (zluxGpuAvailable() != 0);
 	return v;
+}
+
+// Set when any CUDA call fails. The GPU path is then abandoned for the rest of
+// the session rather than retried per frame: a device that failed once will
+// usually keep failing, and retrying turns one bad frame into a stalled render.
+inline std::atomic<bool>& Disabled()
+{
+	static std::atomic<bool> d{false};
+	return d;
 }
 
 // One context for the process. Creating it costs ~70-105 ms, far too much to
@@ -3828,23 +3999,63 @@ inline bool Enabled()
 // costs little: the depth preprocessing and the composite (the other ~70 ms)
 // still run fully in parallel across MFR threads, and the GPU is far from
 // saturated at ~27 gathers/second.
-inline ZluxGpuContext* Ctx()
+inline ZluxGpuContext*& CtxSlot()
 {
 	static ZluxGpuContext* c = zluxGpuCreate();
 	return c;
+}
+inline ZluxGpuContext* Ctx() { return CtxSlot(); }
+
+// ── Crash breadcrumbs ───────────────────────────────────────────────────────
+// The GPU path crashed inside After Effects while running clean in the
+// standalone harness, and AE's own error reporter swallows the fault before
+// Windows records it. This writes one line per stage, flushed and closed
+// immediately, so the LAST line in the file names the stage that died. Enabled
+// only when ZLUX_TRACE is set, so a normal render pays nothing.
+inline const char* TracePath()
+{
+	static const char* p = std::getenv("ZLUX_TRACE");
+	return p;
+}
+
+inline void Trace(const char* stage, long long a = -1, long long b = -1)
+{
+	const char* path = TracePath();
+	if (!path) return;
+	static std::mutex m;
+	std::lock_guard<std::mutex> lk(m);
+	if (FILE* f = std::fopen(path, "a")) {
+		std::fprintf(f, "[tid %5lu] %-22s %lld %lld\n",
+		             static_cast<unsigned long>(GetCurrentThreadId()), stage, a, b);
+		std::fclose(f);   // close every time: a crash must not lose the tail
+	}
 }
 
 // Serialises device access across MFR render threads. Held for the whole
 // upload -> launch -> readback sequence, because the context's buffers are
 // single-instance.
+// Releases the device context. Safe to call when nothing was ever created.
+inline void Shutdown();
+
 inline std::mutex& DeviceMutex()
 {
 	static std::mutex m;
 	return m;
 }
 
+inline void Shutdown()
+{
+	std::lock_guard<std::mutex> lk(DeviceMutex());
+	if (ZluxGpuContext* c = Ctx()) {
+		zluxGpuDestroy(c);
+		CtxSlot() = nullptr;
+	}
+}
+
 inline bool RunGather(const ZluxGatherParams& gp,
                       const DOFSettings& s,
+                      const PF_EffectWorld* aperture_tex_world,
+                      const PF_EffectWorld* iris_mod_world,
                       const SourcePyramid& pyramid,
                       const std::vector<VogelLUT>& luts,
                       const std::vector<float>& signed_coc,
@@ -3853,10 +4064,10 @@ inline bool RunGather(const ZluxGatherParams& gp,
                       const std::vector<CoCTileData>& tiles,
                       A_long tiles_x, A_long out_w, A_long out_h,
                       PF_FpLong inv_w, PF_FpLong inv_h,
-                      std::vector<float4_gpu>& out_far,
-                      std::vector<float4_gpu>& out_near,
-                      std::vector<float4_gpu>& out_bleed,
-                      std::vector<float4_gpu>& out_matte)
+                      std::unique_ptr<float4_gpu[]>& out_far,
+                      std::unique_ptr<float4_gpu[]>& out_near,
+                      std::unique_ptr<float4_gpu[]>& out_bleed,
+                      std::unique_ptr<float4_gpu[]>& out_matte)
 {
 #ifdef ZLUX_PROFILE
 	auto t_enter = std::chrono::steady_clock::now();
@@ -3865,10 +4076,21 @@ inline bool RunGather(const ZluxGatherParams& gp,
 	// once-per-process cost (AE pays it on the first rendered frame of a
 	// session), NOT a per-frame one -- the profile below breaks it out so a
 	// single-frame harness run is not mistaken for steady-state cost.
+	Trace("enter", out_w, out_h);
+	if (Disabled().load(std::memory_order_relaxed)) return false;
 	ZluxGpuContext* ctx = Ctx();
-	if (!ctx) return false;
+	if (!ctx) { Disabled().store(true, std::memory_order_relaxed); return false; }
+
+	// Any CUDA failure below latches the GPU path off for the session. Wrapped in
+	// a helper so every early return goes through it -- a silent `return false`
+	// would retry the same failing device on the next frame.
+	struct Latch {
+		bool tripped = true;
+		~Latch() { if (tripped) Disabled().store(true, std::memory_order_relaxed); }
+	} latch;
 	// Everything from here to the readback touches the shared device buffers.
 	std::lock_guard<std::mutex> device_lock(DeviceMutex());
+	Trace("lock acquired");
 
 	const size_t n = static_cast<size_t>(out_w) * static_cast<size_t>(out_h);
 #ifdef ZLUX_PROFILE
@@ -3886,57 +4108,18 @@ inline bool RunGather(const ZluxGatherParams& gp,
 	lap("ctx init (1x)");
 
 	// ── Radii ───────────────────────────────────────────────────────────────
-	std::vector<float> far_r(n), near_r(n), bleed_r(n), depth_f(n);
+	// Only the centre-depth field still comes from the host: it is produced by
+	// the CPU depth chain, which has not moved to the device yet. The three
+	// radii are computed on the GPU right after the upload -- see below.
+	// depth_cache is already std::vector<float>, so it uploads directly -- the
+	// staging copy this used to make was pure memcpy for no reason.
+	// Only the per-tile near reach needs packing, and that is a few hundred
+	// values, not a frame.
+	std::vector<float> tile_min(tiles.size());
+	for (size_t i = 0; i < tiles.size(); ++i)
+		tile_min[i] = static_cast<float>(tiles[i].min_coc);
 	const PF_FpLong px_per_coc = 0.15 / std::max(inv_w, inv_h);
-	const bool uniform = s.no_depth;
-	PF_FpLong uniform_base = std::max<PF_FpLong>(0.0, s.blur_strength);
-
-	ParallelRows(out_h, 16, [&](A_long y0, A_long y1) {
-		for (A_long y = y0; y < y1; ++y) {
-			for (A_long x = 0; x < out_w; ++x) {
-				const size_t pidx = static_cast<size_t>(y) * out_w + x;
-				depth_f[pidx] = depth_cache[pidx];
-				if (uniform) {
-					// Uniform-blur mode: one far layer over the whole frame, with
-					// field curvature still contributing an edge falloff.
-					PF_FpLong ur = uniform_base;
-					if (s.field_curvature > 0.001) {
-						const PF_FpLong u = (x + 0.5) * inv_w;
-						const PF_FpLong v = (y + 0.5) * inv_h;
-						ur += FieldCurvatureCoc(u, v, s.field_curvature, s.field_sweet);
-					}
-					far_r[pidx]   = static_cast<float>(ur);
-					near_r[pidx]  = 0.0f;
-					bleed_r[pidx] = 0.0f;
-					continue;
-				}
-				const PF_FpLong sc = signed_coc[pidx];
-				// Far: own CoC, or the occlusion-sliver rescue radius.
-				PF_FpLong sliver_far = 0.0;
-				const PF_FpLong sliver = DetectCocSliver(
-					signed_coc.data(), out_w, out_h, x, y, sc, &sliver_far);
-				const PF_FpLong far_need =
-					std::max(std::max<PF_FpLong>(0.0, sc), sliver * sliver_far);
-				far_r[pidx] = static_cast<float>(far_need > 0.001 ? far_need : 0.0);
-
-				// Near: tile-dilated max near reach, so a nearby near pixel can
-				// still splash into this one even if it is focused itself.
-				const A_long tx = x / kCocTileSize, ty = y / kCocTileSize;
-				const CoCTileData& tile = tiles[static_cast<size_t>(ty) * tiles_x + tx];
-				const PF_FpLong nr = std::max(std::max<PF_FpLong>(0.0, -tile.min_coc),
-				                              std::max<PF_FpLong>(0.0, -sc));
-				near_r[pidx] = static_cast<float>(nr > 0.001 ? nr : 0.0);
-
-				// Bleed-over probe. Computed for every pixel rather than only
-				// where focus_mask clears its threshold: focus_mask is derived
-				// downstream in the composite, and a zero radius costs the kernel
-				// nothing, so this avoids duplicating that logic here.
-				const PF_FpLong nb = ProbeFarReachWide(
-					signed_coc.data(), out_w, out_h, x, y, px_per_coc);
-				bleed_r[pidx] = static_cast<float>(nb > 0.012 ? nb : 0.0);
-			}
-		}
-	});
+	const PF_FpLong uniform_base = std::max<PF_FpLong>(0.0, s.blur_strength);
 
 	lap("radii");
 
@@ -3948,7 +4131,8 @@ inline bool RunGather(const ZluxGatherParams& gp,
 		lvl_w[L] = pyramid.levels[static_cast<size_t>(L)].w;
 		lvl_h[L] = pyramid.levels[static_cast<size_t>(L)].h;
 	}
-	if (zluxGpuUploadPyramid(ctx, lvl_data, lvl_w, lvl_h, nlev) != 0) return false;
+	Trace("upload pyramid", nlev, lvl_w[0]);
+	if (zluxGpuUploadPyramid(ctx, lvl_data, lvl_w, lvl_h, nlev) != 0) { Trace("FAIL pyramid"); return false; }
 	lap("upload pyramid");
 
 	std::vector<ZluxVogelHot>     hot;
@@ -3970,35 +4154,105 @@ inline bool RunGather(const ZluxGatherParams& gp,
 			cold.push_back(c);
 		}
 	}
+	// Aperture layers + the per-bokeh rotation table. Uploaded every frame: the
+	// layers are small and may be animated, and re-uploading is far cheaper than
+	// tracking their validity.
+	{
+		float rot[256];
+		for (int i = 0; i < 128; ++i) {
+			rot[i * 2 + 0] = static_cast<float>(kBokehRotLUT[i].first);
+			rot[i * 2 + 1] = static_cast<float>(kBokehRotLUT[i].second);
+		}
+		std::vector<float> lum;
+		if (aperture_tex_world && ApertureLayerToLuma(aperture_tex_world, lum)) {
+			zluxGpuUploadApertureTex(ctx, 0, lum.data(),
+			                         aperture_tex_world->width, aperture_tex_world->height, rot);
+		} else {
+			zluxGpuUploadApertureTex(ctx, 0, nullptr, 0, 0, rot);
+		}
+		if (iris_mod_world && ApertureLayerToLuma(iris_mod_world, lum)) {
+			zluxGpuUploadApertureTex(ctx, 1, lum.data(),
+			                         iris_mod_world->width, iris_mod_world->height, nullptr);
+		}
+	}
+
 	float bg[257];
 	for (int i = 0; i < 257; ++i) bg[i] = static_cast<float>(s.bokeh_gamma_lut[i]);
 	if (zluxGpuUploadLuts(ctx, hot.data(), cold.data(), static_cast<int>(hot.size()),
-	                      descs.data(), static_cast<int>(descs.size()), bg) != 0) return false;
+	                      descs.data(), static_cast<int>(descs.size()), bg) != 0) { Trace("FAIL luts"); return false; }
 	lap("upload luts");
 
 	ZluxGatherFields F{};
 	F.signed_coc    = signed_coc.data();
+	// Null: the device builds this itself right after the upload (see below), so
+	// there is nothing to transfer.
 	F.coc_disc_dist = disc_dist.empty() ? nullptr : disc_dist.data();
-	F.far_radius    = far_r.data();
-	F.near_radius   = near_r.data();
-	F.bleed_radius  = bleed_r.data();
-	F.center_depth  = depth_f.data();
-	if (zluxGpuUploadFields(ctx, &gp, &F) != 0) return false;
+	F.far_radius    = nullptr;   // built on the device
+	F.near_radius   = nullptr;
+	F.bleed_radius  = nullptr;
+	F.center_depth  = depth_cache.data();
+	Trace("upload fields");
+	if (zluxGpuUploadFields(ctx, &gp, &F) != 0) { Trace("FAIL fields"); return false; }
 	lap("upload fields");
 
-	out_far.resize(n); out_near.resize(n); out_bleed.resize(n); out_matte.resize(n);
+	Trace("radii (gpu)");
+	if (zluxGpuBuildRadii(ctx, &gp, tile_min.data(), tiles_x,
+	                      static_cast<int>(tiles.size()) / std::max(1, tiles_x),
+	                      static_cast<int>(kCocTileSize), static_cast<float>(px_per_coc),
+	                      static_cast<float>(uniform_base),
+	                      static_cast<float>(s.field_curvature),
+	                      static_cast<float>(s.field_sweet)) != 0) {
+		Trace("FAIL radii"); return false;
+	}
+	lap("radii gpu");
+
+	// Only when the CPU stage was skipped; otherwise the uploaded field stands.
+	if (disc_dist.empty()) {
+		Trace("disc dist (gpu)");
+		if (zluxGpuBuildDiscDist(ctx, &gp) != 0) { Trace("FAIL disc dist"); return false; }
+		lap("disc dist gpu");
+	}
+
+	// No host allocation here: zluxGpuGather fills its own page-locked staging
+	// buffers and returns pointers into them. Sizing std::vectors for this cost
+	// ~95 MB of zero-fill per frame on top of the transfer itself.
 	ZluxGatherOutputs O{};
-	O.far_rgba   = reinterpret_cast<float*>(out_far.data());
-	O.near_rgba  = reinterpret_cast<float*>(out_near.data());
-	O.bleed_rgba = reinterpret_cast<float*>(out_bleed.data());
-	O.mattes     = reinterpret_cast<float*>(out_matte.data());
 
 	float kernel_ms = 0.0f;
-	if (zluxGpuGather(ctx, &gp, &O, &kernel_ms) != 0) return false;
+	Trace("launch");
+	if (zluxGpuGather(ctx, &gp, &O, &kernel_ms) != 0) { Trace("FAIL gather"); return false; }
+	Trace("gather ok");
+	latch.tripped = false;   // full success -- keep the GPU path armed
+
+	// Take a per-frame copy while the device lock is still held.
+	//
+	// O.* point into the CONTEXT's pinned staging buffers, which the next frame
+	// will overwrite -- and, on a resolution change, cudaFreeHost outright. After
+	// Effects renders several frames concurrently (MFR) and at different sizes
+	// (comp view plus the Effect Controls thumbnail), so handing those pointers
+	// to the compositor, which reads them after this function returns and the
+	// lock is released, is a use-after-free. The pinned buffers stay worthwhile:
+	// they make the device->host transfer ~8x faster, and this host->host copy is
+	// a straight memcpy of already-resident pages.
+	//
+	// `new float4_gpu[n]` default-initializes a trivial type, i.e. leaves it
+	// uninitialized -- deliberately, so this does not reintroduce the ~95 MB of
+	// zero-fill per frame that std::vector::resize was costing.
+	out_far  .reset(new float4_gpu[n]);
+	out_near .reset(new float4_gpu[n]);
+	out_bleed.reset(new float4_gpu[n]);
+	std::memcpy(out_far  .get(), O.far_rgba,   n * sizeof(float4_gpu));
+	std::memcpy(out_near .get(), O.near_rgba,  n * sizeof(float4_gpu));
+	std::memcpy(out_bleed.get(), O.bleed_rgba, n * sizeof(float4_gpu));
+	if (gp.has_alpha) {
+		out_matte.reset(new float4_gpu[n]);
+		std::memcpy(out_matte.get(), O.mattes, n * sizeof(float4_gpu));
+	}
 	lap("kernel+readback");
 #ifdef ZLUX_PROFILE
 	std::fprintf(stderr, "  [prof] cuda kernel        %8.1f ms\n", kernel_ms);
 #endif
+	Trace("copied out");
 	return true;
 }
 #else
@@ -4092,7 +4346,7 @@ static PF_Err RenderPixelImpl(void* refcon, A_long x, A_long y, PIX* inP, PIX* o
 				if (r->gpu_far) {
 					const float4_gpu g = r->gpu_far[pidx];
 					blurred = { g.x, g.y, g.z };
-					if (has_alpha) out_alpha = r->gpu_matte[pidx].x;
+					if (has_alpha && r->gpu_matte) out_alpha = r->gpu_matte[pidx].x;
 				} else {
 				PassOutput f = GatherPass<DofPass::Far>(
 					*r->pyramid, r->aperture_tex_world, r->iris_mod_world,
@@ -4157,7 +4411,7 @@ static PF_Err RenderPixelImpl(void* refcon, A_long x, A_long y, PIX* inP, PIX* o
 				} else if (r->gpu_far) {
 					const float4_gpu g = r->gpu_far[pidx];
 					far_rgb = { g.x, g.y, g.z };
-					if (has_alpha) far_matte = r->gpu_matte[pidx].x;
+					if (has_alpha && r->gpu_matte) far_matte = r->gpu_matte[pidx].x;
 				} else {
 					PassOutput f = GatherPass<DofPass::Far>(
 						*r->pyramid, r->aperture_tex_world, r->iris_mod_world,
@@ -4201,7 +4455,7 @@ static PF_Err RenderPixelImpl(void* refcon, A_long x, A_long y, PIX* inP, PIX* o
 				const float4_gpu g = r->gpu_near[pidx];
 				near_rgb = { g.x, g.y, g.z };
 				near_alpha = g.w;
-				if (has_alpha) near_matte = r->gpu_matte[pidx].y;
+				if (has_alpha && r->gpu_matte) near_matte = r->gpu_matte[pidx].y;
 			} else if (near_r > 0.001 && !kSkipNear) {
 				PassOutput n = GatherPass<DofPass::Near>(
 					*r->pyramid, r->aperture_tex_world, r->iris_mod_world,
@@ -4295,7 +4549,13 @@ static PF_Err RenderPixelImpl(void* refcon, A_long x, A_long y, PIX* inP, PIX* o
 							const float4_gpu g = r->gpu_bleed[pidx];
 							fb_rgb = { g.x, g.y, g.z };
 							fb_w = g.w;
-							fb_matte = r->gpu_matte[pidx].z;
+							// gpu_matte is only allocated for sources that carry
+							// transparency -- the CPU path reads fb.matte from a
+							// struct field, which is always valid, so translating
+							// it to a pointer read needs the same guard the other
+							// three matte reads have.
+							fb_matte = (has_alpha && r->gpu_matte)
+								? r->gpu_matte[pidx].z : alpha;
 						} else {
 							PassOutput fb = GatherPass<DofPass::Far>(
 								*r->pyramid, r->aperture_tex_world, r->iris_mod_world,
@@ -5869,7 +6129,14 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 	// transform fills the (approximate Euclidean) distance to the nearest seed.
 	// The gather compares this one read against the per-pixel reach. signed_coc_
 	// cache is final at this point (tile dilation does not modify it).
-	if (needs_bokeh) {
+	// Skipped when the CUDA path is active: zluxGpuBuildDiscDist regenerates this
+	// field on the device from the CoC texture that is uploaded anyway, so the
+	// sequential chamfer sweeps below (13.7 ms, unthreadable) are pure waste.
+	// ZLUX_CPUDISC=1 forces the legacy CPU chamfer so the two implementations can
+	// be A/B'd back to back under identical conditions.
+	static const bool kForceCpuDisc = (std::getenv("ZLUX_CPUDISC") != nullptr);
+	const bool disc_on_gpu = needs_bokeh && zlux_gpu::Enabled() && !kForceCpuDisc;
+	if (needs_bokeh && !disc_on_gpu) {
 		constexpr float kDiscThresh = 0.03f;
 		const float kBig = static_cast<float>(out_w + out_h); // > any in-frame distance
 		coc_disc_dist.assign(pixel_count, kBig);
@@ -5950,7 +6217,12 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 	// Anything the kernel does not implement (custom aperture texture, iris
 	// modulator, astigmatism) is rejected by zluxGpuCanRender and silently falls
 	// back to the CPU gather, so enabling a GPU never changes plugin output.
-	std::vector<float4_gpu> gpu_far, gpu_near, gpu_bleed, gpu_matte;
+	// Timed so the panel badge can report what actually ran and how long the
+	// gather took -- see zlux_gpu::RecordPath.
+	const auto gather_t0 = std::chrono::steady_clock::now();
+	// Owned by the CUDA context's pinned staging buffers, valid until the next
+	// gather on the same context (which the device mutex serialises).
+	std::unique_ptr<float4_gpu[]> gpu_far, gpu_near, gpu_bleed, gpu_matte;
 	bool gpu_active = false;
 #ifdef ZLUX_CUDA
 	if (needs_bokeh && pyramid.num_levels > 0 && zlux_gpu::Enabled()) {
@@ -5974,6 +6246,7 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 		gp.highlight_boost = static_cast<float>(local.highlight_boost);
 		gp.bokeh_gamma = static_cast<float>(local.bokeh_gamma);
 		gp.highlight_scatter = static_cast<float>(local.highlight_scatter);
+		gp.highlight_mode = local.highlight_mode;
 		gp.highlights_low = static_cast<float>(local.highlights_low);
 		gp.highlights_high = static_cast<float>(local.highlights_high);
 		gp.highlights_softness = static_cast<float>(local.highlights_softness);
@@ -5987,10 +6260,18 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 		gp.ca_gm = static_cast<float>(local.ca_gm);
 		gp.ca_by = static_cast<float>(local.ca_by);
 		gp.near_blur_factor = static_cast<float>(local.near_blur_factor);
+		gp.astigmatism = static_cast<float>(local.astigmatism);
+		gp.astigmatism_sagittal = local.astigmatism_type_sagittal ? 1 : 0;
+		gp.has_aperture_tex = (local.aperture_shape_mode == 4 && aperture_tex_world) ? 1 : 0;
+		gp.has_iris_mod = (iris_mod_world && local.aperture_shape_mode != 4) ? 1 : 0;
+		gp.aperture_texture_intensity = static_cast<float>(local.aperture_texture_intensity);
+		gp.aperture_texture_scale = static_cast<float>(local.aperture_texture_scale);
+		gp.aperture_texture_offset = static_cast<float>(local.aperture_texture_offset);
+		gp.aperture_texture_invert = local.aperture_texture_invert ? 1 : 0;
 
-		if (zluxGpuCanRender(&gp, aperture_tex_world ? 1 : 0, iris_mod_world ? 1 : 0,
-		                     static_cast<float>(local.astigmatism))) {
-			gpu_active = zlux_gpu::RunGather(gp, local, pyramid, vogel_luts_store,
+		if (zluxGpuCanRender(&gp, aperture_tex_world ? 1 : 0, iris_mod_world ? 1 : 0)) {
+			gpu_active = zlux_gpu::RunGather(gp, local, aperture_tex_world, iris_mod_world,
+			                                 pyramid, vogel_luts_store,
 			                                 signed_coc_cache, coc_disc_dist,
 			                                 depth_cache, coc_tiles_dilated,
 			                                 tiles_x, out_w, out_h, inv_w, inv_h,
@@ -5998,6 +6279,7 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 		}
 	}
 #endif // ZLUX_CUDA
+	zlux_gpu::Trace(gpu_active ? "RC: gpu_active" : "RC: gpu inactive");
 	ZLUX_PROF("cuda gather");
 
 	// ── Half-resolution Far pre-pass ─────────────────────────────────────
@@ -6195,10 +6477,11 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 	// Hand the composite the GPU gather results. Null unless the kernel ran, in
 	// which case every gather call site below falls back to GatherPass.
 	if (gpu_active) {
-		rc.gpu_far   = gpu_far.data();
-		rc.gpu_near  = gpu_near.data();
-		rc.gpu_bleed = gpu_bleed.data();
-		rc.gpu_matte = gpu_matte.data();
+		zlux_gpu::Trace("RC: wiring refcon");
+		rc.gpu_far   = gpu_far.get();
+		rc.gpu_near  = gpu_near.get();
+		rc.gpu_bleed = gpu_bleed.get();
+		rc.gpu_matte = gpu_matte.get();
 	}
 	rc.far_halfres = far_halfres.empty() ? nullptr : far_halfres.data();
 	rc.far_alpha_halfres = far_alpha_halfres.empty() ? nullptr : far_alpha_halfres.data();
@@ -6218,12 +6501,23 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 	// Final per-pixel pass, parallelized across all cores (see ParallelApply).
 	// Replaces the single-threaded AE iterate suite that previously serialized
 	// the whole compositing + near-gather stage on one core.
+	zlux_gpu::Trace("RC: before ParallelApply", rc.gpu_far ? 1 : 0, rc.gpu_matte ? 1 : 0);
 	if (is_float) {
 		ParallelApply<PF_PixelFloat>(src_world, output, &rc);
 	} else if (is_deep) {
 		ParallelApply<PF_Pixel16>(src_world, output, &rc);
 	} else {
 		ParallelApply<PF_Pixel8>(src_world, output, &rc);
+	}
+	zlux_gpu::Trace("RC: after ParallelApply");
+	// Record here, not at the gather stage: on the CPU path the gather happens
+	// INSIDE ParallelApply, so an earlier measurement would report ~0 for it.
+	// This span is the blur work in both cases, so the badge's numbers are
+	// comparable between paths.
+	if (needs_bokeh) {
+		const float blur_ms = std::chrono::duration<float, std::milli>(
+			std::chrono::steady_clock::now() - gather_t0).count();
+		zlux_gpu::RecordPath(gpu_active ? zlux_gpu::Path::Gpu : zlux_gpu::Path::Cpu, blur_ms);
 	}
 
 	ZLUX_PROF("main apply");
@@ -6288,6 +6582,13 @@ static PF_Err GlobalSetdown(PF_InData* in_data, PF_OutData* out_data, PF_ParamDe
 {
 	(void)in_data; (void)out_data; (void)params; (void)output;
 	zlux_banner::ReleaseBanner();
+#ifdef ZLUX_CUDA
+	// Return the ~170 MB of device memory (and the pinned host staging) when AE
+	// unloads the plug-in. Without this the CUDA context lived for the whole AE
+	// session even while nothing used the effect, which is exactly the kind of
+	// squatting that makes AE report "GPU out of memory" for unrelated effects.
+	zlux_gpu::Shutdown();
+#endif
 	return PF_Err_NONE;
 }
 
@@ -6386,6 +6687,76 @@ static PF_Err DrawBannerFallback(const DRAWBOT_Suites& d,
 	return err;
 }
 
+// ── "GPU" / "CPU" badge in the banner's bottom-right corner ────────────────
+//
+// Whether the gather ran on the GPU was previously invisible, which is exactly
+// how a session went by with the GPU path disabled while it "felt faster". This
+// shows what the LAST render actually did, plus how long the blur took, so a
+// silent fallback to the CPU (unsupported feature, no CUDA device, unhealthy
+// device) reads as a state rather than as mysterious slowness.
+static PF_Err DrawPathBadge(const DRAWBOT_Suites& d,
+                            DRAWBOT_SurfaceRef surface_ref,
+                            DRAWBOT_SupplierRef supplier_ref,
+                            const DRAWBOT_RectF32& rect)
+{
+	PF_Err err = PF_Err_NONE;
+	const int path = zlux_gpu::LastPath().load(std::memory_order_relaxed);
+	if (path == static_cast<int>(zlux_gpu::Path::Unknown)) return err;   // nothing rendered yet
+
+	const bool on_gpu = (path == static_cast<int>(zlux_gpu::Path::Gpu));
+	const float ms = zlux_gpu::LastGatherMs().load(std::memory_order_relaxed);
+
+	char label[64];
+	std::snprintf(label, sizeof(label), "%s  %.0f ms", on_gpu ? "GPU" : "CPU", ms);
+
+	DRAWBOT_UTF16Char text[64];
+	CopyAsciiToUtf16(label, text, sizeof(text) / sizeof(text[0]));
+
+	// Pill sized to the text; anchored bottom-right with a small inset.
+	const float pad_x = 7.0f, pad_y = 3.0f, inset = 6.0f;
+	const float text_w = 7.0f * static_cast<float>(std::strlen(label));
+	const float bw = text_w + pad_x * 2.0f;
+	const float bh = 15.0f;
+	if (rect.width < bw + inset * 2.0f || rect.height < bh + inset * 2.0f) return err;
+
+	DRAWBOT_RectF32 pill;
+	pill.left   = rect.left + rect.width  - bw - inset;
+	pill.top    = rect.top  + rect.height - bh - inset;
+	pill.width  = bw;
+	pill.height = bh;
+
+	// Green when the GPU is doing the work, amber when it is not -- amber rather
+	// than red because the CPU path is a correct, supported mode, not an error.
+	DRAWBOT_ColorRGBA fill = on_gpu ? DRAWBOT_ColorRGBA{0.11f, 0.42f, 0.18f, 0.88f}
+	                                : DRAWBOT_ColorRGBA{0.45f, 0.33f, 0.08f, 0.88f};
+	DRAWBOT_ColorRGBA ink  = on_gpu ? DRAWBOT_ColorRGBA{0.68f, 1.00f, 0.74f, 1.0f}
+	                                : DRAWBOT_ColorRGBA{1.00f, 0.88f, 0.60f, 1.0f};
+
+	DRAWBOT_BrushRef bg_brush = nullptr, fg_brush = nullptr;
+	DRAWBOT_PathRef  pill_path = nullptr;
+	DRAWBOT_FontRef  font = nullptr;
+
+	ERR(d.supplier_suiteP->NewBrush(supplier_ref, &fill, &bg_brush));
+	ERR(d.supplier_suiteP->NewPath(supplier_ref, &pill_path));
+	ERR(d.path_suiteP->AddRect(pill_path, &pill));
+	ERR(d.surface_suiteP->FillPath(surface_ref, bg_brush, pill_path, kDRAWBOT_FillType_Default));
+
+	ERR(d.supplier_suiteP->NewBrush(supplier_ref, &ink, &fg_brush));
+	ERR(d.supplier_suiteP->NewDefaultFont(supplier_ref, 10.0f, &font));
+	if (!err && fg_brush && font) {
+		DRAWBOT_PointF32 origin{pill.left + pad_x, pill.top + bh - pad_y - 1.0f};
+		ERR(d.surface_suiteP->DrawString(surface_ref, fg_brush, font, text,
+		                                 &origin, kDRAWBOT_TextAlignment_Default,
+		                                 kDRAWBOT_TextTruncation_None, 0.0f));
+	}
+
+	if (bg_brush)  d.supplier_suiteP->ReleaseObject(reinterpret_cast<DRAWBOT_ObjectRef>(bg_brush));
+	if (fg_brush)  d.supplier_suiteP->ReleaseObject(reinterpret_cast<DRAWBOT_ObjectRef>(fg_brush));
+	if (pill_path) d.supplier_suiteP->ReleaseObject(reinterpret_cast<DRAWBOT_ObjectRef>(pill_path));
+	if (font)      d.supplier_suiteP->ReleaseObject(reinterpret_cast<DRAWBOT_ObjectRef>(font));
+	return err;
+}
+
 static PF_Err DrawBannerImage(const DRAWBOT_Suites& d,
                               DRAWBOT_SurfaceRef surface_ref,
                               DRAWBOT_SupplierRef supplier_ref,
@@ -6473,6 +6844,13 @@ static PF_Err DrawBannerImage(const DRAWBOT_Suites& d,
 		DRAWBOT_PointF32 img_origin{0.0f, 0.0f};
 		ERR(d.surface_suiteP->DrawImage(surface_ref, img_ref, &img_origin, 1.0f));
 		ERR(d.surface_suiteP->PopStateStack(surface_ref));
+
+		// ── GPU / CPU badge ────────────────────────────────────────────────
+		// Reports the path the LAST render actually took, not the configured
+		// one, so a silent CPU fallback is visible instead of just feeling
+		// slow. Drawn after the image (hence the Pop above) so it is not
+		// affected by the banner's scale matrix.
+		DrawPathBadge(d, surface_ref, supplier_ref, rect);
 	}
 
 	if (img_ref) d.supplier_suiteP->ReleaseObject(reinterpret_cast<DRAWBOT_ObjectRef>(img_ref));
@@ -7349,6 +7727,18 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 	// barely affected.
 	AEFX_CLR_STRUCT(def); PF_ADD_FLOAT_SLIDERX(STR(StrID_Highlights_BokehGamma), 0.0f, 3.0f, 0.0f, 3.0f, 1.4f, PF_Precision_HUNDREDTHS, 0, 0, HIGHLIGHTS_BOKEH_GAMMA_DISK_ID);
 	AEFX_CLR_STRUCT(def); PF_ADD_FLOAT_SLIDERX(STR(StrID_Highlights_Scatter), 0.0f, 100.0f, 0.0f, 100.0f, 15.0f, PF_Precision_HUNDREDTHS, 0, 0, HIGHLIGHTS_SCATTER_DISK_ID);
+	// How Highlight Scatter combines with the gather.
+	//   Additive     -- the historical behaviour: specular taps accumulate into
+	//                   an un-normalised bucket that is layered on top, so a
+	//                   bright point can push the result past the source's own
+	//                   peak and clip to flat white.
+	//   Preservative -- the specular emphasis is folded into the gather WEIGHTS
+	//                   and renormalised, so the result stays a convex
+	//                   combination of the sampled colours. It can never exceed
+	//                   the brightest sample, exposure and dynamic range are
+	//                   preserved, and the highlight is concentrated by
+	//                   redistributing energy rather than inventing it.
+	AEFX_CLR_STRUCT(def); PF_ADD_POPUP(STR(StrID_Highlights_Mode), 2, 1, STR(StrID_Highlights_Mode_Choices), HIGHLIGHTS_MODE_DISK_ID);
 	AEFX_CLR_STRUCT(def); PF_ADD_FLOAT_SLIDERX(STR(StrID_Highlights_Recovery), 0.0f, 100.0f, 0.0f, 100.0f, 65.0f, PF_Precision_HUNDREDTHS, 0, 0, HIGHLIGHTS_RECOVERY_DISK_ID);
 	AEFX_CLR_STRUCT(def); PF_ADD_COLOR(STR(StrID_Highlights_Tint), PF_MAX_CHAN8, PF_MAX_CHAN8, PF_MAX_CHAN8, HIGHLIGHTS_TINT_DISK_ID);
 	AEFX_CLR_STRUCT(def); PF_END_TOPIC(HIGHLIGHTS_GROUP_END_DISK_ID);
@@ -7551,6 +7941,7 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
 	s.highlights_saturation = ClampValue<PF_FpLong>(DecodeSlider(params[ZLUXDOF_HIGHLIGHTS_SATURATION]) * 0.01, -1.0, 1.0);
 	s.bokeh_gamma = ClampValue<PF_FpLong>(DecodeSlider(params[ZLUXDOF_HIGHLIGHTS_BOKEH_GAMMA]), 0.0, 3.0);
 	s.highlight_scatter = Clamp01(DecodeSlider(params[ZLUXDOF_HIGHLIGHTS_SCATTER]) * 0.01);
+	s.highlight_mode = params[ZLUXDOF_HIGHLIGHTS_MODE]->u.pd.value - 1;
 	s.highlight_recovery = Clamp01(DecodeSlider(params[ZLUXDOF_HIGHLIGHTS_RECOVERY]) * 0.01);
 	s.highlights_tint = {
 		static_cast<PF_FpLong>(params[ZLUXDOF_HIGHLIGHTS_TINT]->u.cd.value.red) / 255.0,
@@ -7703,6 +8094,7 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
 	CHECKOUT_VAL(ZLUXDOF_HIGHLIGHTS_SATURATION, p_hsat); s.highlights_saturation = ClampValue<PF_FpLong>(p_hsat.u.fs_d.value * 0.01, -1.0, 1.0); CHECKIN_VAL(p_hsat);
 	CHECKOUT_VAL(ZLUXDOF_HIGHLIGHTS_BOKEH_GAMMA, p_bg); s.bokeh_gamma = ClampValue<PF_FpLong>(p_bg.u.fs_d.value, 0.0, 3.0); CHECKIN_VAL(p_bg);
 	CHECKOUT_VAL(ZLUXDOF_HIGHLIGHTS_SCATTER, p_hsc); s.highlight_scatter = Clamp01(p_hsc.u.fs_d.value * 0.01); CHECKIN_VAL(p_hsc);
+	CHECKOUT_VAL(ZLUXDOF_HIGHLIGHTS_MODE, p_hmo); s.highlight_mode = p_hmo.u.pd.value - 1; CHECKIN_VAL(p_hmo);
 	CHECKOUT_VAL(ZLUXDOF_HIGHLIGHTS_RECOVERY, p_hrc); s.highlight_recovery = Clamp01(p_hrc.u.fs_d.value * 0.01); CHECKIN_VAL(p_hrc);
 	CHECKOUT_VAL(ZLUXDOF_HIGHLIGHTS_TINT, p_ht);
 	s.highlights_tint = { static_cast<PF_FpLong>(p_ht.u.cd.value.red) / 255.0, static_cast<PF_FpLong>(p_ht.u.cd.value.green) / 255.0, static_cast<PF_FpLong>(p_ht.u.cd.value.blue) / 255.0 };

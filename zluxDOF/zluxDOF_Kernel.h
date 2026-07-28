@@ -82,12 +82,25 @@ typedef struct {
 	float highlight_boost;
 	float bokeh_gamma;          // >0 enables the LUT weighting
 	float highlight_scatter;
+	int   highlight_mode;   // 0 = additive sprite, 1 = preservative (renormalised)
 	float highlights_low, highlights_high, highlights_softness;
 	float spherical_aberration_amount, spherical_aberration_scale;
 	float vignetting, vignetting_scale;
 	float catadioptric;
 	float ca_strength, ca_rc, ca_gm, ca_by;
 	float near_blur_factor;
+	float astigmatism;              // 0 = off
+	int   astigmatism_sagittal;     // 0 = tangential swirl, 1 = radial
+
+	// Aperture-texture paths. `aperture_shape_mode == 4` REPLACES the baked iris
+	// mask with the texture; the iris modulator MULTIPLIES whatever shape is
+	// already baked. Both need a per-tap texture fetch.
+	int   has_aperture_tex;         // custom iris shape layer uploaded
+	int   has_iris_mod;             // iris modulator layer uploaded
+	float aperture_texture_intensity;
+	float aperture_texture_scale;
+	float aperture_texture_offset;
+	int   aperture_texture_invert;
 } ZluxGatherParams;
 
 // Per-pixel gather inputs that vary across the frame and are produced by the
@@ -128,7 +141,20 @@ const char* zluxGpuDeviceName(void);
 // (custom aperture texture, iris modulator) and the astigmatism/multi-tap
 // path. Callers must fall back to the CPU gather when this returns 0, so the
 // plugin never changes its output just because a GPU is present.
-int zluxGpuCanRender(const ZluxGatherParams* params, int has_aperture_tex, int has_iris_mod, float astigmatism);
+//
+// Astigmatism IS supported (params->astigmatism); the remaining rejections are
+// the two paths that must sample an After Effects layer per tap.
+int zluxGpuCanRender(const ZluxGatherParams* params, int has_aperture_tex, int has_iris_mod);
+
+// Uploads an aperture layer as a single-channel LUMA texture.
+// `slot`: 0 = custom iris shape, 1 = iris modulator.
+// Luma is a linear combination of RGB and bilinear filtering is linear, so
+// folding the layer to luma before upload is exactly equivalent to sampling RGB
+// and taking luma per tap -- at a quarter of the bandwidth.
+// Also uploads the 128-entry per-bokeh rotation table (pass NULL to keep it).
+int zluxGpuUploadApertureTex(ZluxGpuContext* ctx, int slot,
+                             const float* luma, int w, int h,
+                             const float* rot_cos_sin_128);
 
 ZluxGpuContext* zluxGpuCreate(void);
 void            zluxGpuDestroy(ZluxGpuContext* ctx);
@@ -151,6 +177,21 @@ int zluxGpuUploadLuts(ZluxGpuContext* ctx,
 // Uploads the per-pixel CoC / radius / depth fields.
 int zluxGpuUploadFields(ZluxGpuContext* ctx, const ZluxGatherParams* params,
                         const ZluxGatherFields* fields);
+
+// Builds the CoC-discontinuity distance field on the device from the already
+// uploaded signed-CoC texture, replacing the CPU's sequential chamfer transform.
+// Call after zluxGpuUploadFields and before zluxGpuGather. When this is used,
+// pass fields.coc_disc_dist = NULL so nothing is uploaded for it.
+int zluxGpuBuildDiscDist(ZluxGpuContext* ctx, const ZluxGatherParams* params);
+
+// Computes the three per-pixel gather radii on the device from the uploaded CoC
+// texture, replacing the CPU precompute AND three full-frame uploads.
+// Call after zluxGpuUploadFields; then far/near/bleed_radius in ZluxGatherFields
+// may be NULL.
+int zluxGpuBuildRadii(ZluxGpuContext* ctx, const ZluxGatherParams* params,
+                      const float* tile_min_coc, int tiles_x, int tiles_y,
+                      int tile_size, float px_per_coc, float uniform_base,
+                      float field_curvature, float field_sweet);
 
 // Runs the far + near gathers and copies the results back into `out`.
 // Returns 0 on success. `elapsed_ms` receives pure kernel time when non-null.

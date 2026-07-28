@@ -59,6 +59,26 @@ int main(int argc, char** argv) {
     make_world(dep_w, dep.data(), W, H);
     make_world(out_w, out.data(), W, H);
 
+    // Optional aperture layers, so the custom-iris and iris-modulator paths can
+    // be A/B'd against the CPU reference like every other mode.
+    //   ZLUX_APTEX=file.raw:W:H   custom iris shape  (also set ZLUX_SHAPE=4)
+    //   ZLUX_IRISTEX=file.raw:W:H iris modulator
+    std::vector<unsigned char> ap_buf, ir_buf;
+    PF_EffectWorld ap_w{}, ir_w{};
+    PF_EffectWorld* ap_p = nullptr;
+    PF_EffectWorld* ir_p = nullptr;
+    auto load_layer = [](const char* spec, std::vector<unsigned char>& buf,
+                         PF_EffectWorld& w) -> PF_EffectWorld* {
+        if (!spec) return nullptr;
+        char path[512]; int lw = 0, lh = 0;
+        if (sscanf(spec, "%511[^:]:%d:%d", path, &lw, &lh) != 3) return nullptr;
+        buf = read_raw(path, (long)lw * lh * 4);
+        make_world(w, buf.data(), lw, lh);
+        return &w;
+    };
+    ap_p = load_layer(getenv("ZLUX_APTEX"),   ap_buf, ap_w);
+    ir_p = load_layer(getenv("ZLUX_IRISTEX"), ir_buf, ir_w);
+
     (void)mode; (void)enc; (void)fmm; (void)fno; (void)sw; (void)snear; (void)sfar;
     DOFSettings s{};
     s.display_mode = disp;       // 1 Rendered, 9 CoC heat, 2 depth, 3 focus map
@@ -77,13 +97,26 @@ int main(int argc, char** argv) {
     s.energy_conserving = getenv("ZLUX_ENERGY") ? (atol(getenv("ZLUX_ENERGY")) != 0) : FALSE;
     // (srgb_linear / bg_inpaint were retired from DOFSettings; the harness used to
     //  drive them via ZLUX_SRGB / ZLUX_INPAINT.)
+    // ZLUX_NODEPTH reproduces "no depth layer connected" -- the uniform-blur
+    // path AE takes when the Depth Map slot is empty. This is what the plugin
+    // does by default in a fresh comp, and it was never covered by the harness.
+    s.no_depth = getenv("ZLUX_NODEPTH") ? TRUE : FALSE;
+    // Lens Character knobs used to A/B the CUDA port against the CPU reference.
+    s.astigmatism = getenv("ZLUX_ASTIG") ? atof(getenv("ZLUX_ASTIG")) : 0.0;
+    s.astigmatism_type_sagittal = getenv("ZLUX_SAGITTAL") ? TRUE : FALSE;
+    s.anamorphic_ratio = getenv("ZLUX_ANAM") ? atof(getenv("ZLUX_ANAM")) : 1.0;
     s.aperture_blades = 6;
-    s.aperture_shape_mode = 1;   // circular
+    s.aperture_shape_mode = getenv("ZLUX_SHAPE") ? atol(getenv("ZLUX_SHAPE")) : 1;
+    s.aperture_texture_intensity = getenv("ZLUX_APINT") ? atof(getenv("ZLUX_APINT")) : 1.0;
+    s.aperture_texture_scale = getenv("ZLUX_APSCALE") ? atof(getenv("ZLUX_APSCALE")) : 1.0;
+    s.aperture_texture_offset = getenv("ZLUX_APOFF") ? atof(getenv("ZLUX_APOFF")) : 0.0;
+    s.aperture_texture_invert = getenv("ZLUX_APINV") ? TRUE : FALSE;
     s.auto_focus_point = { 0.5, 0.5 };
     // Highlight engine -- default to the plugin's real defaults, override via env.
     s.bokeh_gamma     = getenv("ZLUX_GAMMA")   ? atof(getenv("ZLUX_GAMMA"))   : 0.8;
     s.highlight_recovery = getenv("ZLUX_REC")  ? atof(getenv("ZLUX_REC"))     : 0.0;
     s.highlight_scatter  = getenv("ZLUX_SCAT") ? atof(getenv("ZLUX_SCAT"))    : 0.0;
+    s.highlight_mode     = getenv("ZLUX_HLMODE")? atol(getenv("ZLUX_HLMODE"))  : 0;
     s.highlight_boost    = getenv("ZLUX_BOOST")? atof(getenv("ZLUX_BOOST"))   : 0.0;
     s.highlights_low = 200.0; s.highlights_high = 255.0; s.highlights_softness = 0.01;
 
@@ -96,7 +129,7 @@ int main(int argc, char** argv) {
     for (int rep = 0; rep < reps; ++rep) {
         if (reps > 1) fprintf(stderr, "----- frame %d/%d -----\n", rep + 1, reps);
         err = RenderCore(nullptr, nullptr, &src_w, &out_w, &dep_w,
-                         nullptr, nullptr, s, FALSE, FALSE);
+                         ap_p, ir_p, s, FALSE, FALSE);
     }
     fprintf(stderr, "RenderCore err=%d\n", (int)err);
 

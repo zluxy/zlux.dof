@@ -13,14 +13,14 @@ REM The C++ side is then built with /DZLUX_CUDA, which is what makes RenderCore
 REM route the gather to the GPU when a device is present.
 REM Set ZLUX_NOGPU=1 at run time to force the CPU gather (the reference path).
 "%CUDA%\bin\nvcc.exe" -c ..\zluxDOF\zluxDOF_Kernel.cu -o zluxDOF_Kernel.obj ^
-   --use-local-env -O3 -m64 -std=c++17 -gencode arch=compute_120,code=sm_120 -Xcompiler /MD
+   --use-local-env -O3 -m64 -std=c++17 -gencode arch=compute_120,code=sm_120 -Xcompiler /MT
 if errorlevel 1 (
     echo.
     echo *** NVCC FAILED
     exit /b 1
 )
 
-cl /nologo /EHsc /O2 /MD /std:c++17 /DNDEBUG /DZLUX_PROFILE /DZLUX_CUDA /DMSWindows /DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS %INC% /I"%CUDA%\include" ^
+cl /nologo /EHsc /O2 /MT /std:c++17 /DNDEBUG /DZLUX_PROFILE /DZLUX_CUDA /DMSWindows /DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS %INC% /I"%CUDA%\include" ^
    dof_png.cpp ..\zluxDOF\zluxDOF_Strings.cpp %UTIL%\AEGP_SuiteHandler.cpp %UTIL%\MissingSuiteError.cpp %UTIL%\AEFX_SuiteHelper.c ^
    /Fe:dof_png.exe ^
    zluxDOF_Kernel.obj ^

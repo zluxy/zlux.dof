@@ -64,6 +64,8 @@ TableString g_strs[StrID_NUMTYPES] = {
 	{StrID_Highlights_Enhancement, "Bokeh Brightness Boost"},
 	{StrID_Highlights_BokehGamma, "Bokeh Gamma (Highlight Punch)"},
 	{StrID_Highlights_Scatter, "Highlight Scatter (Specular Sprite)"},
+	{StrID_Highlights_Mode, "Highlight Mode"},
+	{StrID_Highlights_Mode_Choices, "Additive|Preservative"},
 	{StrID_Highlights_Recovery, "Highlight Clipping Recovery"},
 	{StrID_Highlights_Tint, "Highlight Tint"},
 	{StrID_ApTex_Group, "Iris Texture"},

@@ -50,3 +50,9 @@ debug/*.exp
 *.suo
 Thumbs.db
 desktop.ini
+
+# ── Debug-session leftovers ─────────────────────────────────────────────────
+# Crash breadcrumbs written by ZLUX_TRACE, and the CUDA runtime copied next to
+# the harness so it can resolve cudart without the toolkit being on PATH.
+debug/*.txt
+debug/*.dll
