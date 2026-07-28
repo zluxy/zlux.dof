@@ -4,9 +4,9 @@
 
 **Photorealistic Depth of Field for Adobe After Effects**
 
-*Vogel-spiral bokeh engine · vintage glass soul · single-file install*
+*Vogel-spiral bokeh engine · vintage glass soul · CUDA accelerated*
 
-![Version](https://img.shields.io/badge/version-2.15.1-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey) ![Host](https://img.shields.io/badge/After%20Effects-2022%2B-9999ff) ![License](https://img.shields.io/badge/license-Freeware-green)
+![Version](https://img.shields.io/badge/version-3.0.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey) ![Host](https://img.shields.io/badge/After%20Effects-2022%2B-9999ff) ![GPU](https://img.shields.io/badge/GPU-CUDA%20%E2%80%A2%20Maxwell%2B-76b900) ![License](https://img.shields.io/badge/license-Freeware-green)
 
 <!-- PLACEHOLDER: hero shot — best-looking frame, heavy bokeh, point lights -->
 ![zluxDOF hero](docs/img/hero.png)
@@ -17,9 +17,31 @@
 
 ---
 
+## GPU accelerated
+
+As of **v3.0.0** the gather runs on the GPU. On a 1920×810 frame at 256 samples
+the depth-of-field pass dropped from **889 ms to 37 ms**, and the whole frame
+from **952 ms to under 90 ms** — measured on a Ryzen 9 9950X3D against an
+RTX 5080.
+
+Every optical feature runs there: astigmatism, anamorphic squeeze, custom
+aperture textures, the iris modulator, chromatic aberration, spherical
+aberration, cat's-eye vignetting and the full highlight engine. The banner in
+the Effect Controls panel shows a **GPU** / **CPU** badge with the last blur
+time, so you always know which path a frame took.
+
+No NVIDIA card? Nothing breaks — the plugin falls back to the CPU renderer that
+shipped before, which is still the reference the GPU path is verified against.
+
+**Requires:** NVIDIA GPU, Maxwell or newer (GTX 900 series and up).
+
+➡️ **[Download the latest release](../../releases/latest)**
+
+---
+
 ## What is it?
 
-zluxDOF is a CPU depth-of-field plugin that simulates how **real glass** renders defocus — not a Gaussian blur with a mask, but a physically-inspired two-pass gather over a Vogel-spiral aperture with depth-aware occlusion, HDR highlight handling and a library of real vintage-lens behaviors: swirl, soap-bubble rims, onion rings, cat's-eye clipping, chromatic fringing, field curvature and halation.
+zluxDOF is a depth-of-field plugin that simulates how **real glass** renders defocus — not a Gaussian blur with a mask, but a physically-inspired two-pass gather over a Vogel-spiral aperture with depth-aware occlusion, HDR highlight handling and a library of real vintage-lens behaviors: swirl, soap-bubble rims, onion rings, cat's-eye clipping, chromatic fringing, field curvature and halation.
 
 Feed it any depth map — AI-generated (Depth Anything / MiDaS), a 3D render Z-pass (EXR linear-Z auto-ranged), or a hand-painted ramp — and it turns flat footage into cinema.
 
