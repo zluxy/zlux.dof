@@ -94,6 +94,10 @@ enum {
 	ZLUXDOF_ASPECT_RATIO,
 	ZLUXDOF_APERTURE_SIZE,
 	ZLUXDOF_SAMPLE_COUNT,
+	// v3.1: how much the gather is allowed to pre-average the source before it
+	// integrates the disc. Governs how crisp a bokeh edge can get -- see the
+	// footprint-floor block in GatherPass.
+	ZLUXDOF_BOKEH_DEFINITION,
 	ZLUXDOF_ENERGY_CONSERVING,
 	ZLUXDOF_SOFTNESS,
 	ZLUXDOF_ONION_RINGS,
@@ -337,7 +341,10 @@ enum {
 	// disk IDs were never persisted, so nothing is reserved here.
 
 	// v2.27: Depth Levels custom-UI control (histogram + handles).
-	DEPTH_LEVELS_DISK_ID
+	DEPTH_LEVELS_DISK_ID,
+
+	// v3.1: Bokeh Definition (source pre-filter floor).
+	BOKEH_DEFINITION_DISK_ID
 };
 
 // Aperture-map picker grid layout (clickable custom-UI thumbnail grid).

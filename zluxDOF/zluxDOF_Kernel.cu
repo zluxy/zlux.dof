@@ -32,6 +32,7 @@
 
 #include <cuda_runtime.h>
 #include <math_constants.h>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -102,6 +103,10 @@ struct ZluxGpuContext {
 	ZluxVogelCold*    d_cold  = nullptr;
 	ZluxVogelLutDesc* d_descs = nullptr;
 	int               num_luts = 0;
+	// Allocated capacity, so a ladder that grows between frames reallocates
+	// instead of overrunning buffers sized by the first frame.
+	size_t            lut_cap  = 0;   // samples in d_hot / d_cold
+	int               desc_cap = 0;   // entries in d_descs
 
 	// Outputs.
 	float4* d_farRGBA   = nullptr;
@@ -123,10 +128,43 @@ struct ZluxGpuContext {
 	float*  d_tileMinCoc = nullptr;
 	size_t  tile_cap = 0;
 
-	float4* h_farRGBA   = nullptr;
-	float4* h_nearRGBA  = nullptr;
-	float4* h_bleedRGBA = nullptr;
-	float4* h_mattes    = nullptr;
+	// Thin-declutter scratch. Separate from the gather buffers because this
+	// stage runs BEFORE them, while the CoC field still lives on the host.
+	float*  d_declCoc     = nullptr;
+	float*  d_declProtect = nullptr;
+	float2* d_declStatA   = nullptr;
+	float2* d_declStatB   = nullptr;
+	float*  d_declOut     = nullptr;
+	float*  d_declScratch = nullptr;
+	size_t  decl_cap = 0;
+
+	// Pool of page-locked result sets, one per in-flight frame.
+	//
+	// A single shared set is not enough: After Effects renders several frames
+	// concurrently, and the compositor reads these buffers AFTER the device
+	// mutex is released, so the next frame would overwrite them mid-read. The
+	// previous fix copied each set into fresh heap memory, which cost ~75 MB of
+	// host-to-host memcpy per frame. Handing out a whole pinned set instead
+	// removes that copy: the device-to-host transfer lands straight in the
+	// buffer the compositor will read.
+	struct ResultSet {
+		float4* far   = nullptr;
+		float4* near_ = nullptr;
+		float4* bleed = nullptr;
+		float4* matte = nullptr;
+		// Claimed under the device mutex, released WITHOUT it (the compositor
+		// hands the set back long after the mutex dropped). Plain bool made that
+		// a data race whose realistic failure was a release the claim loop never
+		// observed -- which used to look like permanent pool exhaustion.
+		std::atomic<bool> in_use{false};
+		// Per-set capacity in pixels. Deliberately NOT shared with the context's
+		// alloc_px: growing the frame must never free a set another thread is
+		// still reading out of, so each set is grown independently, by the thread
+		// that owns it, at the moment it claims it.
+		size_t cap = 0;
+	};
+	static const int kResultSets = 4;
+	ResultSet results[kResultSets];
 
 	// Capacity in PIXELS for the linear buffers, not a width/height pair.
 	// Linear buffers are indexed y*width+x, so an allocation made for a larger
@@ -425,12 +463,19 @@ __device__ void GatherPassD(
 	// ── Mip selection, including the radius-tied footprint floor ────────────
 	int   mip   = max(0, MipLevelI(eff_long, actual_N, P.num_levels));
 	float mip_f = MipLevelF(eff_long, actual_N);
+	// Weight LOD -- see the CPU gather for the full reasoning. In short: the old
+	// blanket footprint floor existed to tame the WEIGHT nonlinearities (boost,
+	// bokeh gamma, the scatter threshold), not because the colour needed
+	// blurring. Keep the coarse, stable LOD for those and let Bokeh Definition
+	// dial the colour floor away, and bokeh discs get their hard edge back
+	// without the speckle coming with it.
+	float mip_w = mip_f;
 	{
-		// Floor the footprint at a fixed fraction of the blur radius so a
-		// defocused region always averages a real neighbourhood rather than
-		// echoing sharp source texture into the bokeh (the "fingerprint
-		// speckle"). Rises with highlight boost, which amplifies bright texels.
-		const float k_floor = 0.35f + (energy ? 0.0f : fminf(0.30f, P.highlight_boost * 0.08f));
+		const float k_legacy = 0.35f + (energy ? 0.0f : fminf(0.30f, P.highlight_boost * 0.08f));
+		const float fp_stable = fmaxf(2.0f, effective_radius * k_legacy);
+		mip_w = fmaxf(mip_f, __log2f(fp_stable * 0.5f));
+
+		const float k_floor = k_legacy * (1.0f - Clamp01f(P.bokeh_definition));
 		const float fp_floor = fmaxf(2.0f, effective_radius * k_floor);
 		const float mipf_floor = __log2f(fp_floor * 0.5f);
 		if (mipf_floor > mip_f) mip_f = mipf_floor;
@@ -439,8 +484,13 @@ __device__ void GatherPassD(
 		const int maxL = P.num_levels - 1;
 		mip   = min(mip, maxL);
 		mip_f = fminf(mip_f, (float)maxL);
+		mip_w = fmaxf(mip_f, fminf(mip_w, (float)maxL));
 	}
-	if (fullres_band) { mip = 0; mip_f = 0.0f; }
+	if (fullres_band) { mip = 0; mip_f = 0.0f; mip_w = 0.0f; }
+	// One extra pyramid fetch per tap, so only pay it where a weight
+	// nonlinearity actually exists AND the two LODs differ enough to matter.
+	const bool weight_lod_split = (has_highlight || has_gamma || has_scatter)
+	                            && (mip_w > mip_f + 0.05f);
 
 	// ── Per-pixel blue-noise rotation (interleaved gradient noise) ──────────
 	const float px_f = u / fmaxf(P.inv_w, 1e-9f);
@@ -475,10 +525,17 @@ __device__ void GatherPassD(
 	const float tap_du = major_x * tap_off_px * P.inv_w;
 	const float tap_dv = major_y * tap_off_px * P.inv_h;
 
-	const bool  jitter = (aniso > 1.05f) || (P.mask_angular != 0);
-	const float jit_cell  = effective_radius * 1.7725f * rsqrtf((float)max(1, actual_N));
-	const float jit_amt_u = jit_cell * P.inv_w * 0.55f;
-	const float jit_amt_v = jit_cell * P.inv_h * 0.55f;
+	// Jitter must match the inter-sample spacing PER AXIS. The iris semi-extent
+	// is effective_radius/anam horizontally and effective_radius vertically, so
+	// an elongated iris has proportionally wider spacing along its long axis. A
+	// single isotropic jitter (the previous behaviour) is then far too small to
+	// break the lattice there -- at Aspect Ratio 0 the iris is stretched 10x in
+	// x and the x jitter was 10x short, leaving the sampling grid visible as a
+	// fine cross-hatch over defocused texture.
+	const bool  jitter    = (aniso > 1.05f) || (P.mask_angular != 0);
+	const float jit_base  = 1.7725f * rsqrtf((float)max(1, actual_N)) * 0.55f;
+	const float jit_amt_u = (effective_radius / anam) * jit_base * P.inv_w;
+	const float jit_amt_v =  effective_radius         * jit_base * P.inv_h;
 
 	// ── Accumulators ───────────────────────────────────────────────────────
 	float3 acc = make_float3(0.0f, 0.0f, 0.0f);
@@ -542,11 +599,22 @@ __device__ void GatherPassD(
 			off_u = (ax_tx * tc * tang_scale + ax_sx * sc * sag_scale) / anam;
 			off_v =  ax_ty * tc * tang_scale + ax_sy * sc * sag_scale;
 		} else {
-			// Rotate the baked unit-disc offset by the per-pixel blue-noise angle.
-			const float kx_r = vs.x * cos_bn - vs.y * sin_bn;
-			const float ky_r = vs.x * sin_bn + vs.y * cos_bn;
-			off_u = kx_r * pos_cx;
-			off_v = ky_r * pos_cy;
+			// Rotate on the UNSQUASHED disc, then apply the anamorphic squeeze.
+			//
+			// vs.kx already carries the 1/anamorphic factor, so rotating it
+			// directly computes R(theta)*S*v -- which rotates the ELLIPSE, not
+			// just the samples inside it. For a circle that is harmless (the
+			// point of the rotation is only to shuffle sample positions), but
+			// for an anamorphic iris every pixel then gets its bokeh tilted by
+			// its own blue-noise angle, and the blur direction wobbles from
+			// pixel to pixel as visible ribbing along edges.
+			// Undoing the squeeze, rotating, and re-applying it gives S*R*v:
+			// the ellipse keeps a fixed orientation and only the samples move.
+			const float kxu = vs.x * anam;          // back to cos_a * fr
+			const float rx  = kxu  * cos_bn - vs.y * sin_bn;
+			const float ry  = kxu  * sin_bn + vs.y * cos_bn;
+			off_u = (rx / anam) * pos_cx;
+			off_v =  ry         * pos_cy;
 		}
 
 		float su = u + off_u;
@@ -662,7 +730,13 @@ __device__ void GatherPassD(
 			cr = c.x; cg = c.y; cb = c.z; ca_a = c.w;
 		}
 
-		const float lum = Lumaf(cr, cg, cb);
+		// Weighting colour on its own, steadier LOD (see the mip_w block).
+		float wr = cr, wg = cg, wb = cb;
+		if (weight_lod_split) {
+			const float4 cw = tex2DLod<float4>(texPyr, su, sv, mip_w);
+			wr = cw.x; wg = cw.y; wb = cw.z;
+		}
+		const float lum = Lumaf(wr, wg, wb);
 
 		if (has_highlight) w *= fmaf(lum, P.highlight_boost * 8.0f, 1.0f);
 		if (has_gamma) {
@@ -675,7 +749,7 @@ __device__ void GatherPassD(
 		}
 
 		if (preservative) {
-			const float sf = HighlightMask(cr, cg, cb, P);
+			const float sf = HighlightMask(wr, wg, wb, P);
 			if (sf > 0.001f) w *= fmaf(P.highlight_scatter * 8.0f, sf, 1.0f);
 		}
 
@@ -686,7 +760,8 @@ __device__ void GatherPassD(
 		if (do_alpha) a_acc = fmaf(ca_a, w, a_acc);
 
 		if (additive_scat) {
-			const float sf = HighlightMask(cr, cg, cb, P);
+			// Threshold on the stable LOD; the splatted energy is the sharp colour.
+			const float sf = HighlightMask(wr, wg, wb, P);
 			if (sf > 0.001f) {
 				const float sw = mask * gate * sf;
 				spec.x = fmaf(cr, sw, spec.x);
@@ -745,6 +820,220 @@ __device__ void GatherPassD(
 }
 
 
+
+
+
+// ── Depth-field filter chain (boundary snap, despeckle, declutter) ─────────
+//
+// These three run back to back over the same signed-CoC field, so they share a
+// single upload/download instead of three round trips.
+
+// Buffer variant of DetectCocSliverD; the radii kernel reads the CoC through a
+// texture, these stages through plain memory.
+__device__ __forceinline__ float DetectCocSliverBuf(const float* __restrict__ coc,
+                                                    int w, int h, int x, int y,
+                                                    float center)
+{
+	if (fabsf(center) >= 0.06f) return 0.0f;
+	float c_min = center, c_max = center;
+	#pragma unroll
+	for (int k = 0; k < 2; ++k) {
+		const int o = (k == 0) ? 3 : 6;
+		const float c1 = coc[y * w + min(max(x - o, 0), w - 1)];
+		const float c2 = coc[y * w + min(max(x + o, 0), w - 1)];
+		const float c3 = coc[min(max(y - o, 0), h - 1) * w + x];
+		const float c4 = coc[min(max(y + o, 0), h - 1) * w + x];
+		c_min = fminf(c_min, fminf(fminf(c1, c2), fminf(c3, c4)));
+		c_max = fmaxf(c_max, fmaxf(fmaxf(c1, c2), fmaxf(c3, c4)));
+	}
+	const float fields = fminf(-c_min, c_max);
+	return SmoothStepf(0.012f, 0.04f, fields)
+	     * (1.0f - SmoothStepf(0.03f, 0.06f, fabsf(center)));
+}
+
+// Separable sliding minimum, radius 6. The CPU uses a monotonic deque because it
+// is O(n) per row; on the device 13 direct reads per pass are cheaper than the
+// divergence a deque would cost. The CPU CLIPS the window at the edges rather
+// than clamping, but for a minimum that is identical -- the edge sample is
+// already inside the clipped window.
+#define ZLUX_ERODE_R 6
+
+__global__ void zluxErodeHKernel(const float* __restrict__ src, float* __restrict__ dst,
+                                 int w, int h)
+{
+	const int x = blockIdx.x * blockDim.x + threadIdx.x;
+	const int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= w || y >= h) return;
+	float m = 1e30f;
+	const int row = y * w;
+	for (int k = -ZLUX_ERODE_R; k <= ZLUX_ERODE_R; ++k) {
+		const int xx = x + k;
+		if (xx < 0 || xx >= w) continue;
+		m = fminf(m, src[row + xx]);
+	}
+	dst[row + x] = m;
+}
+
+__global__ void zluxErodeVKernel(const float* __restrict__ src, float* __restrict__ dst,
+                                 int w, int h)
+{
+	const int x = blockIdx.x * blockDim.x + threadIdx.x;
+	const int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= w || y >= h) return;
+	float m = 1e30f;
+	for (int k = -ZLUX_ERODE_R; k <= ZLUX_ERODE_R; ++k) {
+		const int yy = y + k;
+		if (yy < 0 || yy >= h) continue;
+		m = fminf(m, src[yy * w + x]);
+	}
+	dst[y * w + x] = m;
+}
+
+// Occlusion-boundary snap: where the CoC field shows an interpolated sliver
+// between a blurred foreground and a blurred background, pull the value toward
+// the eroded (more negative / nearer) field so the boundary lands crisply
+// instead of reading as a focused ghost stripe.
+__global__ void zluxSnapKernel(const float* __restrict__ coc,
+                               const float* __restrict__ eroded,
+                               float* __restrict__ out, int w, int h)
+{
+	const int x = blockIdx.x * blockDim.x + threadIdx.x;
+	const int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= w || y >= h) return;
+	const int i = y * w + x;
+	const float c = coc[i];
+	const float sliver = DetectCocSliverBuf(coc, w, h, x, y, c);
+	out[i] = (sliver > 0.01f) ? Mixf(c, eroded[i], sliver) : c;
+}
+
+// Isolated-focus-speck suppression: a lone near-focus pixel surrounded in EVERY
+// direction by defocus is almost always depth-map noise, not real detail.
+__global__ void zluxDespeckleKernel(const float* __restrict__ coc,
+                                    const float* __restrict__ protect,
+                                    float* __restrict__ out, int w, int h)
+{
+	const int x = blockIdx.x * blockDim.x + threadIdx.x;
+	const int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= w || y >= h) return;
+	const int i = y * w + x;
+	const float c = coc[i];
+	const float ac = fabsf(c);
+	if (ac >= 0.02f || protect[i] > 0.01f) { out[i] = c; return; }
+
+	const int ax[4] = {1, 0, 1, 1};
+	const int ay[4] = {0, 1, 1, -1};
+	float surround = 10.0f;
+	float repl_sum = 0.0f;
+	int   repl_n = 0;
+	#pragma unroll
+	for (int a = 0; a < 4; ++a) {
+		float side[2];
+		for (int sgn = 0; sgn < 2; ++sgn) {
+			const int dir = sgn ? 1 : -1;
+			float m = 10.0f;
+			for (int o = 3; o <= 6; o += 3) {
+				const int px = min(max(x + ax[a] * dir * o, 0), w - 1);
+				const int py = min(max(y + ay[a] * dir * o, 0), h - 1);
+				const float cv = coc[py * w + px];
+				const float av = fabsf(cv);
+				if (av < m) m = av;
+				if (av >= 0.012f) { repl_sum += cv; ++repl_n; }
+			}
+			side[sgn] = m;
+		}
+		const float axis_blocked = fminf(side[0], side[1]);
+		if (axis_blocked < surround) surround = axis_blocked;
+	}
+	const float t = SmoothStepf(0.015f, 0.035f, surround)
+	              * (1.0f - SmoothStepf(0.008f, 0.02f, ac));
+	out[i] = (t > 0.01f && repl_n > 0) ? Mixf(c, repl_sum / (float)repl_n, t) : c;
+}
+
+// ── Thin-clutter declutter ─────────────────────────────────────────────────
+//
+// A real lens dissolves a thin background occluder (a wire, an antenna) far from
+// focus; AI/game depth maps often tag such structures with a tiny CoC, so the
+// gather spans only a few pixels there and the wire survives as a crisp sliver.
+// The discriminator is purely geometric: a wire is a THIN, UNDER-BLURRED
+// MINORITY inside an otherwise strongly defocused neighbourhood.
+//
+// Two separable box statistics over a 13x13 window decide it:
+//   isb = how many pixels in the window are blurred   (is this a minority?)
+//   cb  = sum of their signed CoC                     (what is the surround?)
+// Edges CLAMP, so the window always covers box_area samples -- matching the
+// CPU's ClampValue indexing exactly.
+#define ZLUX_DECL_R      6
+#define ZLUX_DECL_AREA   ((2 * ZLUX_DECL_R + 1) * (2 * ZLUX_DECL_R + 1))
+
+__global__ void zluxDeclutterSeedKernel(const float* __restrict__ coc,
+                                        float2* __restrict__ stat,
+                                        int w, int h)
+{
+	const int x = blockIdx.x * blockDim.x + threadIdx.x;
+	const int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= w || y >= h) return;
+	const float c = coc[y * w + x];
+	const float b = (fabsf(c) >= 0.012f) ? 1.0f : 0.0f;
+	stat[y * w + x] = make_float2(b, c * b);
+}
+
+__global__ void zluxDeclutterBoxHKernel(const float2* __restrict__ src,
+                                        float2* __restrict__ dst, int w, int h)
+{
+	const int x = blockIdx.x * blockDim.x + threadIdx.x;
+	const int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= w || y >= h) return;
+	float a = 0.0f, b = 0.0f;
+	const int row = y * w;
+	for (int k = -ZLUX_DECL_R; k <= ZLUX_DECL_R; ++k) {
+		const float2 v = src[row + min(max(x + k, 0), w - 1)];
+		a += v.x; b += v.y;
+	}
+	dst[row + x] = make_float2(a, b);
+}
+
+__global__ void zluxDeclutterBoxVKernel(const float2* __restrict__ src,
+                                        float2* __restrict__ dst, int w, int h)
+{
+	const int x = blockIdx.x * blockDim.x + threadIdx.x;
+	const int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= w || y >= h) return;
+	float a = 0.0f, b = 0.0f;
+	for (int k = -ZLUX_DECL_R; k <= ZLUX_DECL_R; ++k) {
+		const float2 v = src[min(max(y + k, 0), h - 1) * w + x];
+		a += v.x; b += v.y;
+	}
+	dst[y * w + x] = make_float2(a, b);
+}
+
+__global__ void zluxDeclutterApplyKernel(const float* __restrict__ coc,
+                                         const float* __restrict__ protect,
+                                         const float2* __restrict__ stat,
+                                         float* __restrict__ out,
+                                         int w, int h)
+{
+	const int x = blockIdx.x * blockDim.x + threadIdx.x;
+	const int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x >= w || y >= h) return;
+	const int i = y * w + x;
+	const float c = coc[i];
+
+	// Near content and anything Foreground Protect flagged is never touched.
+	if (c < 0.0f || protect[i] > 0.01f) { out[i] = c; return; }
+
+	const float2 st = stat[i];
+	const float nblur = st.x;
+	if (nblur < 1.0f) { out[i] = c; return; }
+
+	const float frac = nblur / (float)ZLUX_DECL_AREA;
+	const float mean_blur = st.y / nblur;
+	const float amean = fabsf(mean_blur);
+	const float relU = (amean > 1e-4f) ? Clamp01f(1.0f - fabsf(c) / amean) : 0.0f;
+	// frac is the safety gate: a solid near/subject region is not a minority and
+	// so is never promoted, however aggressive relU gets.
+	const float t = SmoothStepf(0.60f, 0.85f, frac) * SmoothStepf(0.30f, 0.65f, relU);
+	out[i] = (t > 0.01f) ? Mixf(c, mean_blur, t) : c;
+}
 
 // ── Per-pixel gather radii ─────────────────────────────────────────────────
 //
@@ -1079,14 +1368,22 @@ extern "C" void zluxGpuDestroy(ZluxGpuContext* ctx)
 	cudaFree(ctx->d_seedB);
 	cudaFree(ctx->d_disc);
 	cudaFree(ctx->d_tileMinCoc);
+	cudaFree(ctx->d_declCoc);
+	cudaFree(ctx->d_declProtect);
+	cudaFree(ctx->d_declStatA);
+	cudaFree(ctx->d_declStatB);
+	cudaFree(ctx->d_declOut);
+	cudaFree(ctx->d_declScratch);
 	for (int i = 0; i < 2; ++i) {
 		if (ctx->texApTex[i]) cudaDestroyTextureObject(ctx->texApTex[i]);
 		if (ctx->arrApTex[i]) cudaFreeArray(ctx->arrApTex[i]);
 	}
-	cudaFreeHost(ctx->h_farRGBA);
-	cudaFreeHost(ctx->h_nearRGBA);
-	cudaFreeHost(ctx->h_bleedRGBA);
-	cudaFreeHost(ctx->h_mattes);
+	for (int i = 0; i < ZluxGpuContext::kResultSets; ++i) {
+		cudaFreeHost(ctx->results[i].far);
+		cudaFreeHost(ctx->results[i].near_);
+		cudaFreeHost(ctx->results[i].bleed);
+		cudaFreeHost(ctx->results[i].matte);
+	}
 	if (ctx->evStart) cudaEventDestroy(ctx->evStart);
 	if (ctx->evStop)  cudaEventDestroy(ctx->evStop);
 	delete ctx;
@@ -1118,9 +1415,12 @@ extern "C" int zluxGpuUploadPyramid(ZluxGpuContext* ctx,
 		rd.res.mipmap.mipmap = ctx->mipArray;
 
 		cudaTextureDesc td; std::memset(&td, 0, sizeof(td));
-		// Mirror addressing matches the CPU's MirrorCoordSafe edge handling.
-		td.addressMode[0] = cudaAddressModeMirror;
-		td.addressMode[1] = cudaAddressModeMirror;
+		// v3.1: CLAMP, matching the CPU's ClampCoordSafe. Mirroring answered
+		// off-frame taps with a flipped copy of the plate, so a bright point near
+		// the border was gathered twice and printed a phantom bokeh across the
+		// edge. See the ClampCoordSafe comment in zluxDOF.cpp.
+		td.addressMode[0] = cudaAddressModeClamp;
+		td.addressMode[1] = cudaAddressModeClamp;
 		td.filterMode        = cudaFilterModeLinear;
 		td.mipmapFilterMode  = cudaFilterModeLinear;   // hardware trilinear
 		td.normalizedCoords  = 1;
@@ -1138,6 +1438,14 @@ extern "C" int zluxGpuUploadPyramid(ZluxGpuContext* ctx,
 		       "cudaCreateTextureObject(pyramid)");
 	}
 
+	// NOTE on transfer speed: these copies read from pageable std::vector memory,
+	// which the driver must bounce through an internal pinned buffer. The obvious
+	// "fix" -- memcpy each level into a persistent pinned staging buffer and
+	// transfer from there -- is NOT one: it performs the same bounce, just
+	// explicitly and without the driver's chunk pipelining, so it is a wash at
+	// best. A real win needs the pyramid to be BUILT in pinned memory
+	// (MipLevel::data allocated via cudaHostAlloc), which is a change to
+	// SourcePyramid on the C++ side and should be measured before it is made.
 	for (int L = 0; L < num_levels; ++L) {
 		cudaArray_t levelArr = nullptr;
 		CU_TRY(cudaGetMipmappedArrayLevel(&levelArr, ctx->mipArray, L),
@@ -1159,12 +1467,26 @@ extern "C" int zluxGpuUploadLuts(ZluxGpuContext* ctx,
 	ClearErr();
 	if (!ctx || total_samples <= 0 || num_luts <= 0) return 1;
 
-	if (!ctx->d_hot) {
+	// Grow-on-demand rather than size-once. The ladder is a fixed 15 rungs today
+	// so total_samples never changes, which is exactly why sizing off the FIRST
+	// frame looked safe -- but the memcpys below write total_samples of the
+	// CURRENT frame, so the day the ladder becomes adaptive this silently
+	// overruns the device heap. Tracking capacity costs two ints.
+	if (!ctx->d_hot || (size_t)total_samples > ctx->lut_cap) {
+		cudaFree(ctx->d_hot);  ctx->d_hot  = nullptr;
+		cudaFree(ctx->d_cold); ctx->d_cold = nullptr;
+		ctx->lut_cap = 0;
 		CU_TRY(cudaMalloc(&ctx->d_hot,   (size_t)total_samples * sizeof(ZluxVogelHot)),  "cudaMalloc(hot)");
 		CU_TRY(cudaMalloc(&ctx->d_cold,  (size_t)total_samples * sizeof(ZluxVogelCold)), "cudaMalloc(cold)");
-		CU_TRY(cudaMalloc(&ctx->d_descs, (size_t)num_luts * sizeof(ZluxVogelLutDesc)),   "cudaMalloc(descs)");
-		ctx->num_luts = num_luts;
+		ctx->lut_cap = (size_t)total_samples;
 	}
+	if (!ctx->d_descs || num_luts > ctx->desc_cap) {
+		cudaFree(ctx->d_descs); ctx->d_descs = nullptr;
+		ctx->desc_cap = 0;
+		CU_TRY(cudaMalloc(&ctx->d_descs, (size_t)num_luts * sizeof(ZluxVogelLutDesc)),   "cudaMalloc(descs)");
+		ctx->desc_cap = num_luts;
+	}
+	ctx->num_luts = num_luts;   // was only ever set on the first upload
 	CU_TRY(cudaMemcpy(ctx->d_hot,  hot,  (size_t)total_samples * sizeof(ZluxVogelHot),  cudaMemcpyHostToDevice), "memcpy(hot)");
 	CU_TRY(cudaMemcpy(ctx->d_cold, cold, (size_t)total_samples * sizeof(ZluxVogelCold), cudaMemcpyHostToDevice), "memcpy(cold)");
 	CU_TRY(cudaMemcpy(ctx->d_descs, descs, (size_t)num_luts * sizeof(ZluxVogelLutDesc), cudaMemcpyHostToDevice), "memcpy(descs)");
@@ -1260,11 +1582,15 @@ extern "C" int zluxGpuUploadFields(ZluxGpuContext* ctx, const ZluxGatherParams* 
 			                         + 2 * sizeof(short2) + sizeof(float))
 			                  + n * 4 * sizeof(float) * 2;   // arrays + pyramid headroom
 			if (need > freeB / 2) {
+				// BUSY, not FAIL: free VRAM is a moving target owned mostly by
+				// other effects and by AE itself, so this says "not right now",
+				// never "this device is broken". Latching the GPU off here meant
+				// one momentarily crowded frame cost the whole session.
 				std::snprintf(g_last_error, sizeof(g_last_error),
 				              "frame needs %zu MB but only %zu MB free; leaving it to the CPU",
 				              need >> 20, freeB >> 20);
 				g_has_error = true;
-				return 1;
+				return ZLUX_GPU_BUSY;
 			}
 		}
 	}
@@ -1293,14 +1619,13 @@ extern "C" int zluxGpuUploadFields(ZluxGpuContext* ctx, const ZluxGatherParams* 
 		CU_TRY(cudaMalloc(&ctx->d_nearRGBA,    n * sizeof(float4)), "cudaMalloc(nearRGBA)");
 		CU_TRY(cudaMalloc(&ctx->d_bleedRGBA,   n * sizeof(float4)), "cudaMalloc(bleedRGBA)");
 		CU_TRY(cudaMalloc(&ctx->d_mattes,      n * sizeof(float4)), "cudaMalloc(mattes)");
-		cudaFreeHost(ctx->h_farRGBA);   ctx->h_farRGBA = nullptr;
-		cudaFreeHost(ctx->h_nearRGBA);  ctx->h_nearRGBA = nullptr;
-		cudaFreeHost(ctx->h_bleedRGBA); ctx->h_bleedRGBA = nullptr;
-		cudaFreeHost(ctx->h_mattes);    ctx->h_mattes = nullptr;
-		CU_TRY(cudaHostAlloc(&ctx->h_farRGBA,   n * sizeof(float4), cudaHostAllocDefault), "cudaHostAlloc(far)");
-		CU_TRY(cudaHostAlloc(&ctx->h_nearRGBA,  n * sizeof(float4), cudaHostAllocDefault), "cudaHostAlloc(near)");
-		CU_TRY(cudaHostAlloc(&ctx->h_bleedRGBA, n * sizeof(float4), cudaHostAllocDefault), "cudaHostAlloc(bleed)");
-		CU_TRY(cudaHostAlloc(&ctx->h_mattes,    n * sizeof(float4), cudaHostAllocDefault), "cudaHostAlloc(mattes)");
+		// The pinned RESULT sets are deliberately NOT resized here. This runs
+		// under the device mutex, but a set handed to an earlier frame is being
+		// read by that frame's compositor right now, outside the mutex --
+		// cudaFreeHost'ing it here pulled the buffer out from under a live
+		// reader whenever AE raised the resolution mid-session (adjustment
+		// layers switch resolution constantly). Each set now grows itself in
+		// ClaimResultSet, owned by the thread that claimed it.
 		ctx->alloc_px = n;
 	}
 
@@ -1320,6 +1645,71 @@ extern "C" int zluxGpuUploadFields(ZluxGpuContext* ctx, const ZluxGatherParams* 
 }
 
 
+
+
+extern "C" int zluxGpuDepthFilters(ZluxGpuContext* ctx,
+                                   const float* signed_coc, const float* protect,
+                                   int w, int h, int do_snap, int do_despeckle,
+                                   int do_declutter, float* out_coc)
+{
+	ClearErr();
+	if (!ctx || !signed_coc || !protect || !out_coc) return 1;
+	const size_t n = (size_t)w * h;
+
+	if (ctx->decl_cap < n) {
+		cudaFree(ctx->d_declCoc);     ctx->d_declCoc = nullptr;
+		cudaFree(ctx->d_declProtect); ctx->d_declProtect = nullptr;
+		cudaFree(ctx->d_declStatA);   ctx->d_declStatA = nullptr;
+		cudaFree(ctx->d_declStatB);   ctx->d_declStatB = nullptr;
+		cudaFree(ctx->d_declOut);     ctx->d_declOut = nullptr;
+		cudaFree(ctx->d_declScratch); ctx->d_declScratch = nullptr;
+		CU_TRY(cudaMalloc(&ctx->d_declCoc,     n * sizeof(float)),  "cudaMalloc(declCoc)");
+		CU_TRY(cudaMalloc(&ctx->d_declProtect, n * sizeof(float)),  "cudaMalloc(declProtect)");
+		CU_TRY(cudaMalloc(&ctx->d_declStatA,   n * sizeof(float2)), "cudaMalloc(declStatA)");
+		CU_TRY(cudaMalloc(&ctx->d_declStatB,   n * sizeof(float2)), "cudaMalloc(declStatB)");
+		CU_TRY(cudaMalloc(&ctx->d_declOut,     n * sizeof(float)),  "cudaMalloc(declOut)");
+		CU_TRY(cudaMalloc(&ctx->d_declScratch, n * sizeof(float)),  "cudaMalloc(declScratch)");
+		ctx->decl_cap = n;
+	}
+
+	CU_TRY(cudaMemcpy(ctx->d_declCoc, signed_coc, n * sizeof(float), cudaMemcpyHostToDevice), "memcpy(coc up)");
+	CU_TRY(cudaMemcpy(ctx->d_declProtect, protect, n * sizeof(float), cudaMemcpyHostToDevice), "memcpy(protect up)");
+
+	const dim3 block(16, 16, 1);
+	const dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y, 1);
+
+	// cur always names the buffer holding the live field; the stages ping-pong
+	// between d_declCoc and d_declOut so nothing needs an extra copy.
+	float* cur   = ctx->d_declCoc;
+	float* other = ctx->d_declOut;
+	auto flip = [&]() { float* t = cur; cur = other; other = t; };
+
+	if (do_snap) {
+		// Erode into scratch (H) then reuse `other` for the V pass, so the
+		// eroded field and the source are both live for the snap.
+		zluxErodeHKernel<<<grid, block>>>(cur, ctx->d_declScratch, w, h);
+		zluxErodeVKernel<<<grid, block>>>(ctx->d_declScratch,
+		                                  reinterpret_cast<float*>(ctx->d_declStatA), w, h);
+		zluxSnapKernel<<<grid, block>>>(cur, reinterpret_cast<float*>(ctx->d_declStatA),
+		                                other, w, h);
+		flip();
+	}
+	if (do_despeckle) {
+		zluxDespeckleKernel<<<grid, block>>>(cur, ctx->d_declProtect, other, w, h);
+		flip();
+	}
+	if (do_declutter) {
+		zluxDeclutterSeedKernel<<<grid, block>>>(cur, ctx->d_declStatA, w, h);
+		zluxDeclutterBoxHKernel<<<grid, block>>>(ctx->d_declStatA, ctx->d_declStatB, w, h);
+		zluxDeclutterBoxVKernel<<<grid, block>>>(ctx->d_declStatB, ctx->d_declStatA, w, h);
+		zluxDeclutterApplyKernel<<<grid, block>>>(cur, ctx->d_declProtect,
+		                                          ctx->d_declStatA, other, w, h);
+		flip();
+	}
+	CU_TRY(cudaGetLastError(), "depth filter kernels");
+	CU_TRY(cudaMemcpy(out_coc, cur, n * sizeof(float), cudaMemcpyDeviceToHost), "memcpy(coc back)");
+	return 0;
+}
 
 extern "C" int zluxGpuBuildRadii(ZluxGpuContext* ctx, const ZluxGatherParams* P,
                                  const float* tile_min_coc, int tiles_x, int tiles_y,
@@ -1353,7 +1743,6 @@ extern "C" int zluxGpuBuildDiscDist(ZluxGpuContext* ctx, const ZluxGatherParams*
 	ClearErr();
 	if (!ctx || !P || !ctx->texCoc) return 1;
 	const int w = P->cache_w, h = P->cache_h;
-	const size_t n = (size_t)w * h;
 
 	if (!ctx->d_seedA) {
 		CU_TRY(cudaMalloc(&ctx->d_seedA, ctx->alloc_px * sizeof(short2)), "cudaMalloc(seedA)");
@@ -1434,17 +1823,82 @@ extern "C" int zluxGpuGather(ZluxGpuContext* ctx, const ZluxGatherParams* P,
 	// Readback into the page-locked staging buffers, then hand the caller those
 	// pointers directly. The matte buffer is skipped entirely for opaque sources,
 	// which is the common case and saves a quarter of the transfer.
+	// Claim a free result set; the caller owns it until zluxGpuReleaseResults.
+	//
+	// Acquire on the claim pairs with the release in zluxGpuReleaseResults, so a
+	// set handed back by another thread is reliably seen as free here. Without
+	// that pairing a missed release read as "pool permanently exhausted".
 	const size_t n = (size_t)P->width * P->height;
-	CU_TRY(cudaMemcpy(ctx->h_farRGBA,   ctx->d_farRGBA,   n * sizeof(float4), cudaMemcpyDeviceToHost), "memcpy(farRGBA back)");
-	CU_TRY(cudaMemcpy(ctx->h_nearRGBA,  ctx->d_nearRGBA,  n * sizeof(float4), cudaMemcpyDeviceToHost), "memcpy(nearRGBA back)");
-	CU_TRY(cudaMemcpy(ctx->h_bleedRGBA, ctx->d_bleedRGBA, n * sizeof(float4), cudaMemcpyDeviceToHost), "memcpy(bleedRGBA back)");
-	if (P->has_alpha) {
-		CU_TRY(cudaMemcpy(ctx->h_mattes, ctx->d_mattes, n * sizeof(float4), cudaMemcpyDeviceToHost), "memcpy(mattes back)");
+	int slot = -1;
+	for (int i = 0; i < ZluxGpuContext::kResultSets; ++i) {
+		bool expected = false;
+		if (ctx->results[i].in_use.compare_exchange_strong(
+		        expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0) {
+		// TRANSIENT, not a device fault: every set is held by a frame that is
+		// still compositing. Reported as BUSY so the caller renders this frame on
+		// the CPU and keeps the GPU path armed for the next one.
+		std::snprintf(g_last_error, sizeof(g_last_error),
+		              "all %d result sets in flight", ZluxGpuContext::kResultSets);
+		g_has_error = true;
+		return ZLUX_GPU_BUSY;
+	}
+	ZluxGpuContext::ResultSet& r = ctx->results[slot];
+
+	// Grow this set if the frame outgrew it. Safe to free here and nowhere else:
+	// the set is ours exclusively from the successful claim above until we hand
+	// it back, so no compositor can be reading it.
+	if (r.cap < n) {
+		cudaFreeHost(r.far);   r.far   = nullptr;
+		cudaFreeHost(r.near_); r.near_ = nullptr;
+		cudaFreeHost(r.bleed); r.bleed = nullptr;
+		cudaFreeHost(r.matte); r.matte = nullptr;
+		r.cap = 0;
+		struct SlotGuard {                    // release the claim on any failure
+			ZluxGpuContext::ResultSet* s; bool armed = true;
+			~SlotGuard() { if (armed) s->in_use.store(false, std::memory_order_release); }
+		} guard{&r};
+		CU_TRY(cudaHostAlloc(&r.far,   n * sizeof(float4), cudaHostAllocDefault), "cudaHostAlloc(far)");
+		CU_TRY(cudaHostAlloc(&r.near_, n * sizeof(float4), cudaHostAllocDefault), "cudaHostAlloc(near)");
+		CU_TRY(cudaHostAlloc(&r.bleed, n * sizeof(float4), cudaHostAllocDefault), "cudaHostAlloc(bleed)");
+		CU_TRY(cudaHostAlloc(&r.matte, n * sizeof(float4), cudaHostAllocDefault), "cudaHostAlloc(mattes)");
+		r.cap = n;
+		guard.armed = false;
 	}
 
-	out->far_rgba   = reinterpret_cast<float*>(ctx->h_farRGBA);
-	out->near_rgba  = reinterpret_cast<float*>(ctx->h_nearRGBA);
-	out->bleed_rgba = reinterpret_cast<float*>(ctx->h_bleedRGBA);
-	out->mattes     = reinterpret_cast<float*>(ctx->h_mattes);
-	return 0;
+	// From here a failed readback must also give the set back, or the pool would
+	// shrink by one for every transfer error.
+	{
+		struct SlotGuard {
+			ZluxGpuContext::ResultSet* s; bool armed = true;
+			~SlotGuard() { if (armed) s->in_use.store(false, std::memory_order_release); }
+		} guard{&r};
+		CU_TRY(cudaMemcpy(r.far,   ctx->d_farRGBA,   n * sizeof(float4), cudaMemcpyDeviceToHost), "memcpy(farRGBA back)");
+		CU_TRY(cudaMemcpy(r.near_, ctx->d_nearRGBA,  n * sizeof(float4), cudaMemcpyDeviceToHost), "memcpy(nearRGBA back)");
+		CU_TRY(cudaMemcpy(r.bleed, ctx->d_bleedRGBA, n * sizeof(float4), cudaMemcpyDeviceToHost), "memcpy(bleedRGBA back)");
+		if (P->has_alpha) {
+			CU_TRY(cudaMemcpy(r.matte, ctx->d_mattes, n * sizeof(float4), cudaMemcpyDeviceToHost), "memcpy(mattes back)");
+		}
+		guard.armed = false;
+	}
+
+	out->far_rgba   = reinterpret_cast<float*>(r.far);
+	out->near_rgba  = reinterpret_cast<float*>(r.near_);
+	out->bleed_rgba = reinterpret_cast<float*>(r.bleed);
+	out->mattes     = P->has_alpha ? reinterpret_cast<float*>(r.matte) : nullptr;
+	out->slot       = slot;
+	return ZLUX_GPU_OK;
+}
+
+extern "C" void zluxGpuReleaseResults(ZluxGpuContext* ctx, int slot)
+{
+	// Called from the compositor thread WITHOUT the device mutex. The release
+	// ordering publishes everything that thread read out of the buffers before
+	// the claim loop in zluxGpuGather can hand the set to another frame.
+	if (ctx && slot >= 0 && slot < ZluxGpuContext::kResultSets)
+		ctx->results[slot].in_use.store(false, std::memory_order_release);
 }

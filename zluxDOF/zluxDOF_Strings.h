@@ -30,6 +30,7 @@ typedef enum {
 	StrID_Aspect_Ratio,
 	StrID_Aperture_Size,
 	StrID_Sample_Count,
+	StrID_Bokeh_Definition,
 	StrID_Barrel_Distortion,
 	StrID_Softness,
 	StrID_Aperture_Blades,

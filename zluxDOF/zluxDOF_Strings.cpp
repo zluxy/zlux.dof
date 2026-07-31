@@ -2,10 +2,12 @@
 
 typedef struct {
 	A_u_long index;
-	// 512 is large enough for every current preset-popup choice string;
-	// the longest (the preset list itself) sits around 300 chars once
-	// the Laowa cinema lenses are included.
-	A_char str[512];
+	// Sized for the longest choice string, which is always the Lens Preset list
+	// (585 chars at v3.1's 26 presets). Raised 512 -> 1024 when that list
+	// outgrew the old bound -- note the failure was a COMPILE error, not a
+	// silent truncation, so this bound is self-policing: add presets until the
+	// build complains, then raise it again.
+	A_char str[1024];
 } TableString;
 
 TableString g_strs[StrID_NUMTYPES] = {
@@ -14,7 +16,7 @@ TableString g_strs[StrID_NUMTYPES] = {
 	{StrID_Description, "Depth of Field plugin by zlux (Zluxia). Pro-grade cinematic bokeh with lens presets, custom iris, chromatic aberration, highlight shaping and grain."},
 	{StrID_Banner_Param_Name, "zluxDOF"},
 	{StrID_Preset, "Lens Preset"},
-	{StrID_Preset_Choices, "Manual|Helios 44-2 58mm f/2|Cyclop 85mm f/1.5|Mir-1V 37mm f/2.8|Industar-61 L/Z Star|MTO-500 Mirror|Trioplan 100mm f/2.8|Petzval 85 (Lomography)|Canon 50mm f/0.95 Dream|Lensbaby Velvet 56|Sigma 105mm f/1.4 Art|LOMO 35-NAP Anamorphic 2x|Laowa Nanomorph 1.5x|Bokeh: Grungy Vintage|Lensbaby Sweet 50|Lensbaby Burnside 35|Wide Macro Rig (Psyche)|Swirl-o-Tron 58 (Vortex)|Starburst Zoom 35|Anamorphic Comet 2x"},
+	{StrID_Preset_Choices, "Manual|Helios 44-2 58mm f/2|Cyclop 85mm f/1.5|Mir-1V 37mm f/2.8|Industar-61 L/Z Star|MTO-500 Mirror|Trioplan 100mm f/2.8|Petzval 85 (Lomography)|Canon 50mm f/0.95 Dream|Lensbaby Velvet 56|Sigma 105mm f/1.4 Art|LOMO 35-NAP Anamorphic 2x|Laowa Nanomorph 1.5x|Bokeh: Grungy Vintage|Lensbaby Sweet 50|Lensbaby Burnside 35|Wide Macro Rig (Psyche)|Swirl-o-Tron 58 (Vortex)|Starburst Zoom 35|Anamorphic Comet 2x|Sony 135mm STF (Apodized)|Cooke S4/i (Cine Warm)|CCTV 25mm f/1.4 (C-mount)|Rodenstock Imagon (Soft Focus)|Reflex 1000mm (Donut)|Angenieux 25-250 (Vintage Zoom)|Tilt-Shift Miniature"},
 	{StrID_Display_Group, "Display"},
 	{StrID_Display_Mode, "Preview Mode"},
 	{StrID_Display_Mode_Choices, "Rendered|Depth Map|Depth Stabilized|CoC Heat Map|Focus Peaking|Selected Highlights|Iris|Iris Array"},
@@ -38,6 +40,7 @@ TableString g_strs[StrID_NUMTYPES] = {
 	{StrID_Aspect_Ratio, "Aspect Ratio (Anamorphic)"},
 	{StrID_Aperture_Size, "Blur Amount"},
 	{StrID_Sample_Count, "Sample Quality"},
+	{StrID_Bokeh_Definition, "Bokeh Definition"},
 	{StrID_Barrel_Distortion, "Barrel Distortion"},
 	{StrID_Softness, "Bokeh Softness"},
 	{StrID_Aperture_Blades, "Iris Blades"},

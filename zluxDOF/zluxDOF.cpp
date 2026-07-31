@@ -37,6 +37,7 @@ static_assert(ZLUX_PIPL_VERSION ==
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -242,6 +243,18 @@ static void ReleaseBanner()
 // the user having to load each shape as a layer.
 namespace zlux_apmap {
 
+// Immutable once built. That immutability is the whole point: the previous
+// version was ONE process-global cache with a single loaded_index, refilled in
+// place at the top of RenderCore -- which meant that with
+// PF_OutFlag2_SUPPORTS_THREADED_RENDERING set, a second effect instance using a
+// different map would `gray.clear()` the vector while another render thread was
+// midway through reading gray.data() in the gather. That is a use-after-free,
+// and it reallocated on every frame for as long as both instances rendered.
+//
+// Now a load produces a fresh ApMap that nothing mutates afterwards, and every
+// consumer holds a shared_ptr to it for the duration of its frame. Readers
+// therefore cannot have the map pulled out from under them, and two instances
+// on different maps each keep their own rather than fighting over one slot.
 struct ApMap {
 	std::vector<float> gray;   // w*h, transmission in [0,1] (level 0)
 	// Box-filtered mip chain (level k stored at mips[k-1], dims mip_w/mip_h).
@@ -255,20 +268,21 @@ struct ApMap {
 	std::vector<int> mip_h;
 	int w = 0;
 	int h = 0;
-	int loaded_index = -1;     // cached aperture index (-1 = nothing / failed)
 };
-static ApMap g_apmap;
 
-// Builds the box-filtered mip chain down to ~8px. Called once per map load.
-static void BuildApMapMips()
+using ApMapRef = std::shared_ptr<const ApMap>;
+
+// Builds the box-filtered mip chain down to ~8px. Called once per map load,
+// before the map is published to any reader.
+static void BuildApMapMips(ApMap& m)
 {
-	g_apmap.mips.clear();
-	g_apmap.mip_w.clear();
-	g_apmap.mip_h.clear();
-	if (g_apmap.gray.empty()) return;
-	const float* prev = g_apmap.gray.data();
-	int pw = g_apmap.w;
-	int ph = g_apmap.h;
+	m.mips.clear();
+	m.mip_w.clear();
+	m.mip_h.clear();
+	if (m.gray.empty()) return;
+	const float* prev = m.gray.data();
+	int pw = m.w;
+	int ph = m.h;
 	while (pw >= 16 && ph >= 16) {
 		const int nw = pw / 2;
 		const int nh = ph / 2;
@@ -280,10 +294,10 @@ static void BuildApMapMips()
 					(prev[s] + prev[s + 1] + prev[s + pw] + prev[s + pw + 1]) * 0.25f;
 			}
 		}
-		g_apmap.mips.emplace_back(std::move(lvl));
-		g_apmap.mip_w.push_back(nw);
-		g_apmap.mip_h.push_back(nh);
-		prev = g_apmap.mips.back().data();
+		m.mips.emplace_back(std::move(lvl));
+		m.mip_w.push_back(nw);
+		m.mip_h.push_back(nh);
+		prev = m.mips.back().data();
 		pw = nw;
 		ph = nh;
 	}
@@ -313,36 +327,31 @@ static std::vector<std::wstring> ApMapPaths(int index)
 }
 #endif
 
-// Converts a decoded BGRA image into the cached grayscale transmission mask
+// Converts a decoded BGRA image into a grayscale transmission mask
 // (shared by the file and the embedded-resource load paths).
-static void AdoptApMapImage(const zlux_banner::BannerImage& tmp)
+static void AdoptApMapImage(const zlux_banner::BannerImage& tmp, ApMap& m)
 {
-	g_apmap.w = tmp.width;
-	g_apmap.h = tmp.height;
-	g_apmap.gray.assign(static_cast<size_t>(tmp.width) * tmp.height, 0.0f);
-	for (size_t i = 0; i < g_apmap.gray.size(); ++i) {
+	m.w = tmp.width;
+	m.h = tmp.height;
+	m.gray.assign(static_cast<size_t>(tmp.width) * tmp.height, 0.0f);
+	for (size_t i = 0; i < m.gray.size(); ++i) {
 		const uint8_t* px = &tmp.pixels_bgra[i * 4];   // BGRA
-		g_apmap.gray[i] = (px[0] * 0.114f + px[1] * 0.587f + px[2] * 0.299f) * (1.0f / 255.0f);
+		m.gray[i] = (px[0] * 0.114f + px[1] * 0.587f + px[2] * 0.299f) * (1.0f / 255.0f);
 	}
-	BuildApMapMips();
+	BuildApMapMips(m);
 }
 
-// Loads aperture index (1..80) into the cache if not already current. index<=0
-// clears the active selection. Safe to call repeatedly; only reloads on change.
-static void EnsureApMapLoaded(int index)
+// Decodes aperture index (1..80) from disk or the embedded resources. Returns
+// null when nothing could be loaded.
+static ApMapRef DecodeApMap(int index)
 {
-	if (index <= 0) { g_apmap.loaded_index = -1; return; }
-	if (g_apmap.loaded_index == index && !g_apmap.gray.empty()) return;
-	g_apmap.loaded_index = index;   // mark attempted (don't retry a missing file every frame)
-	g_apmap.gray.clear();
-	g_apmap.w = 0;
-	g_apmap.h = 0;
+	auto m = std::make_shared<ApMap>();
 #ifdef AE_OS_WIN
 	for (const std::wstring& p : ApMapPaths(index)) {
 		zlux_banner::BannerImage tmp;
 		if (zlux_banner::DecodePngFile(p, tmp)) {  // GDI+ loads BMP too
-			AdoptApMapImage(tmp);
-			return;
+			AdoptApMapImage(tmp, *m);
+			return m;
 		}
 	}
 	// Embedded copy inside the .aex (APMAP01..APMAP80) -- the normal path
@@ -352,48 +361,79 @@ static void EnsureApMapLoaded(int index)
 		swprintf(res, 16, L"APMAP%02d", index);
 		zlux_banner::BannerImage tmp;
 		if (zlux_banner::DecodeImageResource(res, tmp)) {
-			AdoptApMapImage(tmp);
-			return;
+			AdoptApMapImage(tmp, *m);
+			return m;
 		}
 	}
 #endif
+	return nullptr;
 }
 
-inline bool Active() { return g_apmap.w > 0 && !g_apmap.gray.empty(); }
+// Returns the map for aperture index (1..80), decoding it once and caching it
+// thereafter. index<=0 means "no map". The returned reference keeps the map
+// alive for as long as the caller holds it, which is what makes the readers
+// below safe to run concurrently with another instance loading a different map.
+//
+// Failures are cached as null so a missing file is not re-probed every frame.
+static ApMapRef LoadApMap(int index)
+{
+	if (index <= 0) return nullptr;
+
+	static std::mutex m;
+	static std::map<int, ApMapRef> cache;   // null value = "tried, not available"
+	{
+		std::lock_guard<std::mutex> lk(m);
+		auto it = cache.find(index);
+		if (it != cache.end()) return it->second;
+	}
+
+	// Decode OUTSIDE the lock: it is a GDI+ image decode, and holding the lock
+	// across it would stall every other render thread that wants any map.
+	ApMapRef decoded = DecodeApMap(index);
+
+	std::lock_guard<std::mutex> lk(m);
+	// Another thread may have won the race; keep whichever entry landed first so
+	// all callers observe the same object.
+	auto ins = cache.emplace(index, decoded);
+	return ins.first->second;
+}
+
+inline bool Active(const ApMap* m) { return m && m->w > 0 && !m->gray.empty(); }
 
 // Bilinear transmission sample at a normalized disc position (nx,ny in [-1,1]).
 // Outside the unit square -> blocked. The map's +y row 0 is the top, while the
 // disc's +y points down (AE screen space), so v is flipped.
-inline PF_FpLong Sample(PF_FpLong nx, PF_FpLong ny)
+inline PF_FpLong Sample(const ApMap* m, PF_FpLong nx, PF_FpLong ny)
 {
-	if (!Active()) return 1.0;
+	if (!Active(m)) return 1.0;
 	const PF_FpLong u = nx * 0.5 + 0.5;
 	const PF_FpLong v = ny * 0.5 + 0.5;
 	if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) return 0.0;
-	const PF_FpLong fx = u * (g_apmap.w - 1);
-	const PF_FpLong fy = v * (g_apmap.h - 1);
+	const PF_FpLong fx = u * (m->w - 1);
+	const PF_FpLong fy = v * (m->h - 1);
 	const int x0 = static_cast<int>(fx);
 	const int y0 = static_cast<int>(fy);
-	const int x1 = std::min(x0 + 1, g_apmap.w - 1);
-	const int y1 = std::min(y0 + 1, g_apmap.h - 1);
+	const int x1 = std::min(x0 + 1, m->w - 1);
+	const int y1 = std::min(y0 + 1, m->h - 1);
 	const PF_FpLong tx = fx - x0;
 	const PF_FpLong ty = fy - y0;
-	const float* g = g_apmap.gray.data();
-	const PF_FpLong a = g[static_cast<size_t>(y0) * g_apmap.w + x0];
-	const PF_FpLong b = g[static_cast<size_t>(y0) * g_apmap.w + x1];
-	const PF_FpLong c = g[static_cast<size_t>(y1) * g_apmap.w + x0];
-	const PF_FpLong d = g[static_cast<size_t>(y1) * g_apmap.w + x1];
+	const float* g = m->gray.data();
+	const PF_FpLong a = g[static_cast<size_t>(y0) * m->w + x0];
+	const PF_FpLong b = g[static_cast<size_t>(y0) * m->w + x1];
+	const PF_FpLong c = g[static_cast<size_t>(y1) * m->w + x0];
+	const PF_FpLong d = g[static_cast<size_t>(y1) * m->w + x1];
 	return (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty;
 }
 
 // Bilinear sample at mip level (0 = full res). Used by FinalizeVogelLUT so the
 // per-sample bake reads a prefiltered texel matched to the LUT's density.
-inline PF_FpLong SampleLevel(int level, PF_FpLong nx, PF_FpLong ny)
+inline PF_FpLong SampleLevel(const ApMap* m, int level, PF_FpLong nx, PF_FpLong ny)
 {
-	if (level <= 0 || g_apmap.mips.empty()) return Sample(nx, ny);
-	const int li = std::min(level - 1, static_cast<int>(g_apmap.mips.size()) - 1);
-	const int lw = g_apmap.mip_w[static_cast<size_t>(li)];
-	const int lh = g_apmap.mip_h[static_cast<size_t>(li)];
+	if (!Active(m)) return 1.0;
+	if (level <= 0 || m->mips.empty()) return Sample(m, nx, ny);
+	const int li = std::min(level - 1, static_cast<int>(m->mips.size()) - 1);
+	const int lw = m->mip_w[static_cast<size_t>(li)];
+	const int lh = m->mip_h[static_cast<size_t>(li)];
 	const PF_FpLong u = nx * 0.5 + 0.5;
 	const PF_FpLong v = ny * 0.5 + 0.5;
 	if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) return 0.0;
@@ -405,7 +445,7 @@ inline PF_FpLong SampleLevel(int level, PF_FpLong nx, PF_FpLong ny)
 	const int y1 = std::min(y0 + 1, lh - 1);
 	const PF_FpLong tx = fx - x0;
 	const PF_FpLong ty = fy - y0;
-	const float* g = g_apmap.mips[static_cast<size_t>(li)].data();
+	const float* g = m->mips[static_cast<size_t>(li)].data();
 	const PF_FpLong a = g[static_cast<size_t>(y0) * lw + x0];
 	const PF_FpLong b = g[static_cast<size_t>(y0) * lw + x1];
 	const PF_FpLong c = g[static_cast<size_t>(y1) * lw + x0];
@@ -418,14 +458,14 @@ inline PF_FpLong SampleLevel(int level, PF_FpLong nx, PF_FpLong ny)
 // one sample cell of the map). With ~256 taps over a 256px map the spacing is
 // ~14px -- sampled at full res that aliases the map's fine texture into
 // fingerprint moiré on every disc; level 3 (8px texels) integrates it away.
-inline int PickLevelForSamples(A_long n)
+inline int PickLevelForSamples(const ApMap* m, A_long n)
 {
-	if (!Active() || g_apmap.mips.empty()) return 0;
-	const double spacing = static_cast<double>(g_apmap.w) * 0.886
+	if (!Active(m) || m->mips.empty()) return 0;
+	const double spacing = static_cast<double>(m->w) * 0.886
 	                     / std::sqrt(static_cast<double>(n > 1 ? n : 1));
 	const double lf = std::log2(spacing * 0.5 > 1.0 ? spacing * 0.5 : 1.0);
 	int L = static_cast<int>(std::lround(lf));
-	const int max_l = static_cast<int>(g_apmap.mips.size());
+	const int max_l = static_cast<int>(m->mips.size());
 	if (L < 0) L = 0;
 	if (L > max_l) L = max_l;
 	return L;
@@ -618,6 +658,14 @@ struct DOFSettings {
 	PF_FpLong near_blur_factor;
 	PF_FpLong foreground_protect; // 0..1; keeps sharp near details from being erased by foreground blur
 	A_long sample_count;
+	// v3.1: 0..1. How crisp the bokeh is allowed to be. The gather pre-averages
+	// the source over a footprint floored at a fraction of the blur radius; that
+	// floor is what softens a bokeh disc's edge. 0 reproduces the v3.0 look
+	// (floor = 35% of the radius), 1 removes the floor entirely and lets the
+	// Vogel inter-sample spacing be the only limit -- crisp, hard-edged discs at
+	// the cost of needing the tap count to keep up. See the footprint-floor block
+	// in GatherPass.
+	PF_FpLong bokeh_definition;
 	PF_FpLong matte_top;
 	PF_FpLong matte_bottom;
 	PF_FpLong matte_left;
@@ -687,7 +735,13 @@ struct VogelSample {
 	PF_FpLong sa_neg;
 };
 
-static constexpr A_long kMaxVogelSamples = 1024;
+// v3.1: raised from 1024. With the footprint floor gone (Bokeh Definition) the
+// colour mip follows the Vogel inter-sample spacing, so the tap count is what
+// sets how crisp a disc can get -- and Extreme mode's footprint-derived cap was
+// clipping against the old 1024 ceiling on large bokeh. A LUT is
+// kMaxVogelSamples * sizeof(VogelSample) (~180 KB at 2048); the whole ladder is
+// a few MB, built once per frame.
+static constexpr A_long kMaxVogelSamples = 2048;
 struct VogelLUT {
 	VogelSample samples[kMaxVogelSamples];
 	A_long count;
@@ -997,6 +1051,30 @@ struct SourcePyramid {
 // world-introspection helpers.
 inline bool WorldIsFloat(const PF_EffectWorld* world);
 
+// The bit depth After Effects is driving THIS render at (8, 16 or 32 bpc), taken
+// straight from PF_SmartRenderInput::bitdepth. 0 means "not told", which is the
+// legacy non-smart entry point; WorldIsFloat then falls back to inspecting
+// rowbytes. Every world AE hands an effect in one render -- input, output, depth
+// layer, aperture layers -- is at this depth, so one value answers for all of
+// them.
+//
+// Thread-local because the UI preview and the MFR render threads can be driven
+// at different depths concurrently, and a single global would let one clobber
+// the other mid-frame.
+inline int& WorkingBpc()
+{
+	static thread_local int bpc = 0;
+	return bpc;
+}
+
+// Scoped setter -- restores the previous value so nested/reentrant renders (AE
+// does re-enter the effect for the bokeh preview) cannot leak a depth outward.
+struct ScopedWorkingBpc {
+	int prev;
+	explicit ScopedWorkingBpc(int bpc) : prev(WorkingBpc()) { WorkingBpc() = bpc; }
+	~ScopedWorkingBpc() { WorkingBpc() = prev; }
+};
+
 inline A_long MirrorCoordSafe(A_long c, A_long size)
 {
 	if (size <= 1) return 0;
@@ -1005,6 +1083,21 @@ inline A_long MirrorCoordSafe(A_long c, A_long size)
 	c = c % period;
 	if (c < 0) c += period;
 	return (c >= size) ? (period - 1 - c) : c;
+}
+
+// Pyramid edge handling. v3.1: CLAMP, not mirror.
+//
+// A bokeh disc near the frame border reaches outside the plate, and mirroring
+// answers those taps with a flipped copy of the image -- so a bright point a few
+// pixels inside the edge is gathered TWICE, once at its real position and once
+// as its reflection, and prints a phantom second bokeh outside the frame edge.
+// Clamping extends the border row instead: still not physical (nothing is), but
+// it invents no new features, which is the artifact that actually reads as a
+// mistake on screen. The CUDA texture uses cudaAddressModeClamp to match.
+inline A_long ClampCoordSafe(A_long c, A_long size)
+{
+	if (size <= 1) return 0;
+	return (c < 0) ? 0 : ((c >= size) ? (size - 1) : c);
 }
 
 // Gather colour space. v2.21: LINEAR light is the default. Defocus is physically
@@ -1018,8 +1111,14 @@ inline A_long MirrorCoordSafe(A_long c, A_long size)
 // force the legacy perceptual path with ZLUX_PERCEPTUAL=1 for A/B comparison.
 #ifdef ZLUX_PROFILE
 inline bool ZluxLinear() { static const bool v = std::getenv("ZLUX_PERCEPTUAL") == nullptr; return v; }
+// A/B switch for the v3.1 weight-LOD split (see the mip_w block in GatherPass).
+// The split is the entire justification for letting Bokeh Definition remove the
+// footprint floor, so being able to turn it off and re-measure the speckle is
+// worth a profile-only knob. Never present in a release build.
+inline bool ZluxWeightLodSplit() { static const bool v = std::getenv("ZLUX_NOWLOD") == nullptr; return v; }
 #else
 inline bool ZluxLinear() { return true; }
+inline bool ZluxWeightLodSplit() { return true; }
 #endif
 inline Color3 PercToLin(const Color3& p) {
 	return ZluxLinear() ? p : Color3{ p.r * p.r, p.g * p.g, p.b * p.b };
@@ -1041,10 +1140,10 @@ inline Color3 SampleMipLinear(const MipLevel& L, PF_FpLong u, PF_FpLong v)
 	const PF_FpLong py = v * static_cast<PF_FpLong>(ih) - 0.5;
 	const A_long fx0 = static_cast<A_long>(std::floor(px));
 	const A_long fy0 = static_cast<A_long>(std::floor(py));
-	const A_long x0 = MirrorCoordSafe(fx0, iw);
-	const A_long y0 = MirrorCoordSafe(fy0, ih);
-	const A_long x1 = MirrorCoordSafe(fx0 + 1, iw);
-	const A_long y1 = MirrorCoordSafe(fy0 + 1, ih);
+	const A_long x0 = ClampCoordSafe(fx0, iw);
+	const A_long y0 = ClampCoordSafe(fy0, ih);
+	const A_long x1 = ClampCoordSafe(fx0 + 1, iw);
+	const A_long y1 = ClampCoordSafe(fy0 + 1, ih);
 	// Coordinate math stays in double (precise floor/mirror at 4K), but the
 	// bilinear blend itself runs in single precision: the mip data is float, so
 	// this avoids 12 float->double widenings per tap and uses float madds. The
@@ -1135,10 +1234,10 @@ inline PF_FpLong SampleMipLinearCh(const MipLevel& L, PF_FpLong u, PF_FpLong v, 
 	const PF_FpLong py = v * static_cast<PF_FpLong>(ih) - 0.5;
 	const A_long fx0 = static_cast<A_long>(std::floor(px));
 	const A_long fy0 = static_cast<A_long>(std::floor(py));
-	const A_long x0 = MirrorCoordSafe(fx0, iw);
-	const A_long y0 = MirrorCoordSafe(fy0, ih);
-	const A_long x1 = MirrorCoordSafe(fx0 + 1, iw);
-	const A_long y1 = MirrorCoordSafe(fy0 + 1, ih);
+	const A_long x0 = ClampCoordSafe(fx0, iw);
+	const A_long y0 = ClampCoordSafe(fy0, ih);
+	const A_long x1 = ClampCoordSafe(fx0 + 1, iw);
+	const A_long y1 = ClampCoordSafe(fy0 + 1, ih);
 	const float fx = static_cast<float>(px - std::floor(px));
 	const float fy = static_cast<float>(py - std::floor(py));
 	const float* p00 = L.data.data() + (static_cast<size_t>(y0) * iw + x0) * 4 + ch;
@@ -1317,9 +1416,25 @@ void PopulatePyramidLevel0(const PF_EffectWorld* src, MipLevel& L0,
 	if (out_has_alpha) *out_has_alpha = any_transp.load(std::memory_order_relaxed);
 }
 
-// 2x2 box-filter downsample; exact inverse of linear bilinear upsampling,
-// so a sample from level (k+1) at UV u,v reproduces what a sample from
-// level k would see if averaged over a 2x2 footprint.
+// 4x4 tent downsample (v3.1; was a 2x2 box).
+//
+// The gather reads essentially all of its defocused colour out of this pyramid,
+// so the pyramid IS the inside of every bokeh disc. A 2x2 box is a terrible
+// low-pass: its stopband leaks badly, so each level keeps a share of the
+// aliasing of the level above it. On a still frame that reads as blocky
+// box-filter texels inside large discs; on a moving one the aliased energy
+// beats against the sampling grid and the defocused texture crawls.
+//
+// A 4x4 tent -- the outer product of (1,3,3,1)/8, i.e. two box passes -- is
+// centred on exactly the same point as the 2x2 box (offsets -1,0,+1,+2 around
+// 2x are symmetric about the box centre), so nothing shifts; it just rolls off
+// an octave earlier. 16 taps per destination texel instead of 4, but only over
+// a quarter-resolution target and only once per frame.
+//
+// Deliberately NOT a Karis / luma-weighted average: that is the standard
+// firefly fix, and it works by throwing away exactly the bright-highlight
+// energy that makes bokeh worth having. Fireflies are handled where they
+// actually originate -- the weight nonlinearity in the gather (see mip_w).
 inline void DownsamplePyramidLevel(const MipLevel& prev, MipLevel& cur)
 {
 	cur.w = std::max<A_long>(1, prev.w / 2);
@@ -1336,48 +1451,50 @@ inline void DownsamplePyramidLevel(const MipLevel& prev, MipLevel& cur)
 	// 2x2 box filter: each destination row is independent, so parallelize by
 	// rows. Levels are built sequentially (each depends on the previous) but
 	// the within-level work fans out across cores.
+	// (1,3,3,1) tent taps at offsets -1,0,+1,+2 from the 2x source position.
+	static constexpr float kTent[4] = {1.0f / 8.0f, 3.0f / 8.0f, 3.0f / 8.0f, 1.0f / 8.0f};
 	ParallelRows(cur.h, 64, [&](A_long y0, A_long y1) {
+	// Row base pointers for the four vertical taps, resolved once per row.
+	const float* rowp[4];
+	const float* rowc[4];
 	for (A_long y = y0; y < y1; ++y) {
-		const A_long py  = std::min<A_long>(prev.h - 1, y * 2);
-		const A_long py1 = std::min<A_long>(prev.h - 1, py + 1);
+		for (int ky = 0; ky < 4; ++ky) {
+			const A_long yy = ClampCoordSafe(y * 2 + ky - 1, prev.h);
+			rowp[ky] = prev.data.data() + static_cast<size_t>(yy) * prev.w * 4;
+			rowc[ky] = edge_aware ? (prev.coc.data() + static_cast<size_t>(yy) * prev.w)
+			                      : nullptr;
+		}
 		for (A_long x = 0; x < cur.w; ++x) {
-			const A_long px  = std::min<A_long>(prev.w - 1, x * 2);
-			const A_long px1 = std::min<A_long>(prev.w - 1, px + 1);
-			const A_long ia = static_cast<A_long>(py ) * prev.w + px;
-			const A_long ib = static_cast<A_long>(py ) * prev.w + px1;
-			const A_long ic = static_cast<A_long>(py1) * prev.w + px;
-			const A_long id = static_cast<A_long>(py1) * prev.w + px1;
-			const float* a = prev.data.data() + static_cast<size_t>(ia) * 4;
-			const float* b = prev.data.data() + static_cast<size_t>(ib) * 4;
-			const float* c = prev.data.data() + static_cast<size_t>(ic) * 4;
-			const float* d = prev.data.data() + static_cast<size_t>(id) * 4;
 			float* dst = cur.data.data() + (static_cast<size_t>(y) * cur.w + x) * 4;
-			if (edge_aware) {
-				const float ca = prev.coc[static_cast<size_t>(ia)];
-				const float cb = prev.coc[static_cast<size_t>(ib)];
-				const float cc = prev.coc[static_cast<size_t>(ic)];
-				const float cd = prev.coc[static_cast<size_t>(id)];
-				const float wa = ca + kEdgeBiasFloor;
-				const float wb = cb + kEdgeBiasFloor;
-				const float wc = cc + kEdgeBiasFloor;
-				const float wd = cd + kEdgeBiasFloor;
-				const float inv = 1.0f / (wa + wb + wc + wd);
-				dst[0] = (a[0]*wa + b[0]*wb + c[0]*wc + d[0]*wd) * inv;
-				dst[1] = (a[1]*wa + b[1]*wb + c[1]*wc + d[1]*wd) * inv;
-				dst[2] = (a[2]*wa + b[2]*wb + c[2]*wc + d[2]*wd) * inv;
-				dst[3] = (a[3]*wa + b[3]*wb + c[3]*wc + d[3]*wd) * inv;
-				// Propagate the MAX blur magnitude so coarser levels keep treating
-				// the texel as defocused (it now holds the blurred side's colour).
-				float m = ca > cb ? ca : cb;
-				m = cc > m ? cc : m;
-				m = cd > m ? cd : m;
-				cur.coc[static_cast<size_t>(y) * cur.w + x] = m;
-			} else {
-				dst[0] = (a[0] + b[0] + c[0] + d[0]) * 0.25f;
-				dst[1] = (a[1] + b[1] + c[1] + d[1]) * 0.25f;
-				dst[2] = (a[2] + b[2] + c[2] + d[2]) * 0.25f;
-				dst[3] = (a[3] + b[3] + c[3] + d[3]) * 0.25f;
+			float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+			float wsum = 0.0f;
+			float cmax = 0.0f;
+			for (int ky = 0; ky < 4; ++ky) {
+				for (int kx = 0; kx < 4; ++kx) {
+					const A_long xx = ClampCoordSafe(x * 2 + kx - 1, prev.w);
+					const float* p = rowp[ky] + static_cast<size_t>(xx) * 4;
+					float w = kTent[ky] * kTent[kx];
+					if (edge_aware) {
+						// Bias toward the more-defocused child so a silhouette does
+						// not drag sharp foreground colour up the pyramid. The tent
+						// weight and the edge bias simply multiply.
+						const float cv = rowc[ky][static_cast<size_t>(xx)];
+						w *= (cv + kEdgeBiasFloor);
+						// Propagate the MAX blur magnitude over the 2x2 CORE only.
+						// Widening it to the whole tent would grow the "defocused"
+						// flag by an extra texel per level and over-bias the chain.
+						if ((ky == 1 || ky == 2) && (kx == 1 || kx == 2) && cv > cmax)
+							cmax = cv;
+					}
+					acc0 += p[0] * w; acc1 += p[1] * w;
+					acc2 += p[2] * w; acc3 += p[3] * w;
+					wsum += w;
+				}
 			}
+			const float inv = (wsum > 1e-20f) ? (1.0f / wsum) : 0.0f;
+			dst[0] = acc0 * inv; dst[1] = acc1 * inv;
+			dst[2] = acc2 * inv; dst[3] = acc3 * inv;
+			if (edge_aware) cur.coc[static_cast<size_t>(y) * cur.w + x] = cmax;
 		}
 	}
 	});
@@ -1424,8 +1541,19 @@ inline void BuildSourcePyramid(const PF_EffectWorld* src, SourcePyramid& pyr, PF
 
 inline bool WorldIsFloat(const PF_EffectWorld* world)
 {
-	return (world->world_flags & PF_WorldFlag_DEEP) == 0 &&
-	       world->rowbytes >= static_cast<A_long>(world->width * sizeof(PF_PixelFloat));
+	// PF_WorldFlag_DEEP marks 16 bpc, so a world carrying it is never float.
+	if ((world->world_flags & PF_WorldFlag_DEEP) != 0) return false;
+
+	// Exact answer whenever AE told us the working depth.
+	if (const int bpc = WorkingBpc()) return bpc == 32;
+
+	// Fallback for the legacy non-smart path: infer from the row stride. This is
+	// ambiguous for very narrow worlds -- AE pads rows to a 64-byte boundary, so
+	// a 4-px-wide 8 bpc row occupies 16 bytes padded to 64, which is exactly
+	// width * sizeof(PF_PixelFloat) and reads as float out of a quarter-sized
+	// buffer. Reachable on thumbnail-sized renders, which is why the smart path
+	// above no longer relies on it.
+	return world->rowbytes >= static_cast<A_long>(world->width * sizeof(PF_PixelFloat));
 }
 
 inline Color3 SampleColorUVWorld(const PF_EffectWorld* world, PF_FpLong u, PF_FpLong v)
@@ -1551,39 +1679,62 @@ bool ComputeDepthAutoRange(const PF_EffectWorld* dw, int ch, PF_FpLong& out_min,
 	// crash. Keep it serial.
 
 	// Pass 1: finite extent (excluding hard infinity sentinels).
+	// Both passes are order-invariant reductions (min, max, counts), so splitting
+	// them across rows is bit-identical to the serial version -- and this
+	// function was the last single-threaded stage of the depth chain, costing
+	// ~8 ms of the frame purely for want of a parallel_for.
+	// `idx` is the GLOBAL sample index, so each row recomputes its own start
+	// rather than relying on a running counter.
+	std::mutex reduce_mx;
 	PF_FpLong mn =  1.0e30;
 	PF_FpLong mx = -1.0e30;
 	A_long n_valid = 0;
-	A_long idx = 0;
-	for (A_long y = 0; y < h; ++y) {
-		const PIX* row = PixelPtr<PIX>(const_cast<PF_EffectWorld*>(dw), 0, y);
-		for (A_long x = 0; x < w; ++x, ++idx) {
-			if (step > 1 && (idx % step) != 0) continue;
-			const PF_FpLong v = ReadDepthChannelRawPix<PIX>(&row[x], ch);
-			if (!std::isfinite(v) || std::abs(v) > kDepthSentinelMag) continue;
-			if (v < mn) mn = v;
-			if (v > mx) mx = v;
-			++n_valid;
+	ParallelRows(h, 16, [&](A_long y0, A_long y1) {
+		PF_FpLong l_mn = 1.0e30, l_mx = -1.0e30;
+		A_long l_n = 0;
+		for (A_long y = y0; y < y1; ++y) {
+			const PIX* row = PixelPtr<PIX>(const_cast<PF_EffectWorld*>(dw), 0, y);
+			A_long idx = y * w;
+			for (A_long x = 0; x < w; ++x, ++idx) {
+				if (step > 1 && (idx % step) != 0) continue;
+				const PF_FpLong v = ReadDepthChannelRawPix<PIX>(&row[x], ch);
+				if (!std::isfinite(v) || std::abs(v) > kDepthSentinelMag) continue;
+				if (v < l_mn) l_mn = v;
+				if (v > l_mx) l_mx = v;
+				++l_n;
+			}
 		}
-	}
+		std::lock_guard<std::mutex> lk(reduce_mx);
+		if (l_mn < mn) mn = l_mn;
+		if (l_mx > mx) mx = l_mx;
+		n_valid += l_n;
+	});
 	if (n_valid <= 0 || (mx - mn) < kEps) return false;
 
 	// Pass 2: histogram over [mn, mx]; take the 0.2 / 99.8 percentile edges.
 	constexpr int kBins = 512;
 	A_long hist[kBins] = { 0 };
 	const PF_FpLong inv_span = static_cast<PF_FpLong>(kBins) / (mx - mn);
-	idx = 0;
-	for (A_long y = 0; y < h; ++y) {
-		const PIX* row = PixelPtr<PIX>(const_cast<PF_EffectWorld*>(dw), 0, y);
-		for (A_long x = 0; x < w; ++x, ++idx) {
-			if (step > 1 && (idx % step) != 0) continue;
-			const PF_FpLong v = ReadDepthChannelRawPix<PIX>(&row[x], ch);
-			if (!std::isfinite(v) || std::abs(v) > kDepthSentinelMag) continue;
-			int b = static_cast<int>((v - mn) * inv_span);
-			if (b < 0) b = 0; else if (b >= kBins) b = kBins - 1;
-			++hist[b];
+	ParallelRows(h, 16, [&](A_long y0, A_long y1) {
+		// Re-stated locally: a [&] capture makes the enclosing constexpr a
+		// captured reference under MSVC, which is then not a constant expression.
+		constexpr int kBinsLocal = 512;
+		A_long l_hist[kBinsLocal] = { 0 };
+		for (A_long y = y0; y < y1; ++y) {
+			const PIX* row = PixelPtr<PIX>(const_cast<PF_EffectWorld*>(dw), 0, y);
+			A_long idx = y * w;
+			for (A_long x = 0; x < w; ++x, ++idx) {
+				if (step > 1 && (idx % step) != 0) continue;
+				const PF_FpLong v = ReadDepthChannelRawPix<PIX>(&row[x], ch);
+				if (!std::isfinite(v) || std::abs(v) > kDepthSentinelMag) continue;
+				int b = static_cast<int>((v - mn) * inv_span);
+				if (b < 0) b = 0; else if (b >= kBins) b = kBins - 1;
+				++l_hist[b];
+			}
 		}
-	}
+		std::lock_guard<std::mutex> lk(reduce_mx);
+		for (int b = 0; b < kBinsLocal; ++b) hist[b] += l_hist[b];
+	});
 	const A_long lo_rank = static_cast<A_long>(static_cast<double>(n_valid) * 0.002);
 	const A_long hi_rank = static_cast<A_long>(static_cast<double>(n_valid) * 0.998);
 	A_long acc = 0; int lo_bin = 0, hi_bin = kBins - 1;
@@ -2328,7 +2479,11 @@ struct PassOutput {
 // float per tap instead of re-deriving it. Only per-pixel masks survive
 // the inner loop: CatsEye (needs field position), SphericalProfile (needs
 // centre depth), custom aperture texture (needs UV for offset).
-inline void FinalizeVogelLUT(VogelLUT& lut, const DOFSettings& s)
+// `apmap` is the caller's snapshot of the selected aperture-map library shape
+// (null when none is selected). Passed in rather than read from a global so the
+// map cannot be swapped out underneath the bake by another render thread.
+inline void FinalizeVogelLUT(VogelLUT& lut, const DOFSettings& s,
+                             const zlux_apmap::ApMap* apmap)
 {
 	const PF_FpLong inv_anam = 1.0 / std::max<PF_FpLong>(0.1, s.anamorphic_ratio);
 	const PF_FpLong cos_rot  = std::cos(s.bokeh_rotation_rad);
@@ -2348,8 +2503,8 @@ inline void FinalizeVogelLUT(VogelLUT& lut, const DOFSettings& s)
 	// map's fine texture is integrated, not aliased, into the bake (full-res
 	// point sampling produced fingerprint moiré on the bokeh discs, amplified
 	// by Bokeh Gamma's weight contrast).
-	const bool has_apmap = (s.aperture_map_index > 0) && zlux_apmap::Active();
-	const int apmap_level = has_apmap ? zlux_apmap::PickLevelForSamples(lut.count) : 0;
+	const bool has_apmap = (s.aperture_map_index > 0) && zlux_apmap::Active(apmap);
+	const int apmap_level = has_apmap ? zlux_apmap::PickLevelForSamples(apmap, lut.count) : 0;
 	const bool has_onion = s.onion_amount > 0.001;
 
 	const PF_FpLong soft_edge_start = has_soft ? (1.0 - s.softness * 0.6) : 1.0;
@@ -2401,7 +2556,7 @@ inline void FinalizeVogelLUT(VogelLUT& lut, const DOFSettings& s)
 			sm *= GetMatteBoxApertureMask({vs.norm_x, vs.norm_y}, s);
 		}
 		if (has_apmap) {
-			sm *= zlux_apmap::SampleLevel(apmap_level, vs.norm_x, vs.norm_y);
+			sm *= zlux_apmap::SampleLevel(apmap, apmap_level, vs.norm_x, vs.norm_y);
 		}
 		if (has_onion) {
 			sm *= OnionRingMask(vs.fr, s.onion_amount, s.onion_count);
@@ -2681,10 +2836,17 @@ PassOutput GatherPass(
 	// Off for round irises (aniso ≈ 1) so the common path stays identical.
 	// Angular-detailed masks also jitter (their rotation budget is tiny).
 	const bool jitter_samples = (aniso_factor > 1.05) || mask_angular;
-	const PF_FpLong jit_cell = effective_radius * 1.7725
+	// Per-axis jitter: the iris semi-extent is effective_radius/anamorphic
+	// horizontally and effective_radius vertically, so an elongated iris has
+	// proportionally wider sample spacing along its long axis. One isotropic
+	// amount cannot break the lattice there -- at Aspect Ratio 0 the iris is
+	// stretched 10x in x and the x jitter fell 10x short, leaving the sampling
+	// grid visible as a fine cross-hatch over defocused texture.
+	const PF_FpLong jit_anam = std::max<PF_FpLong>(0.1, s.anamorphic_ratio);
+	const PF_FpLong jit_base = 1.7725 * 0.55
 	                         / std::sqrt(static_cast<PF_FpLong>(std::max<A_long>(1, actual_N)));
-	const PF_FpLong jit_amt_u = jit_cell * inv_w * 0.55;
-	const PF_FpLong jit_amt_v = jit_cell * inv_h * 0.55;
+	const PF_FpLong jit_amt_u = (effective_radius / jit_anam) * jit_base * inv_w;
+	const PF_FpLong jit_amt_v =  effective_radius             * jit_base * inv_h;
 
 	// Pick the mip level that matches the inter-sample spacing on the
 	// long axis. Each tap now reads from a texel that has already been
@@ -2723,22 +2885,28 @@ PassOutput GatherPass(
 	// throw at it; we enforce that with a floor on the footprint (hence the
 	// mip). It is radius-tied, so tiny/near-focus CoC keeps mip 0 and stays
 	// razor-sharp -- only real defocus gets the floor.
+	//
+	// v3.1: the floor is no longer a hard constant. It was only ever needed to
+	// hide the WEIGHT nonlinearity -- boost and bokeh gamma raise a tap's weight
+	// by a power of its luma, so one sharp bright texel fires as a crawling
+	// speckle, and more samples made it worse because a higher tap count drives
+	// the spacing mip FINER. The colour never needed the blur. So the weighting
+	// luma is now read at `mip_w` (the old 0.35 footprint, rock steady) while the
+	// colour keeps `mip_f`, and Bokeh Definition dials the colour floor away.
+	// At definition 1 the floor is inert and the Vogel spacing -- which is
+	// gap-free by construction -- is the only limit, so this can never introduce
+	// sampling holes, only reveal how much tap budget the user has bought.
+	PF_FpLong mip_w = mip_f;
 	{
-		// Footprint floor = 35% of the blur radius. Below ~6px CoC the floor is
-		// the 2px (mip-0) minimum, so near-focus content stays razor-sharp; it
-		// only engages once a region is genuinely defocused. Tuned on the forest
-		// hero shot: removes the fingerprint speckle / source-texture echo fully
-		// while keeping highlight punch and a crisp bokeh-disc edge (the edge
-		// comes from the aperture MASK, not the source mip, so discs stay round).
-		// Grain control: cranking Bokeh Brightness Boost amplifies bright source
-		// texels in the weighted average, so a single sharp bright pixel fires as a
-		// crawling speckle. Raise the footprint floor with the boost so the gather
-		// reads a more pre-averaged (coarser) texel as the boost climbs -- the
-		// speckle is averaged out before the weighting can amplify it. Costs a
-		// little core sharpness only when the user is pushing boost hard. No effect
-		// in energy-conserving mode (no boost weighting there) or at boost 0.
-		const PF_FpLong k_floor = 0.35 +
+		// The legacy floor, still the reference for the WEIGHT LOD. Cranking
+		// Bokeh Brightness Boost amplifies bright source texels in the weighted
+		// average, so the stable LOD gets coarser as the boost climbs.
+		const PF_FpLong k_legacy = 0.35 +
 			(energy ? 0.0 : std::min<PF_FpLong>(0.30, s.highlight_boost * 0.08));
+		const PF_FpLong fp_stable   = std::max<PF_FpLong>(2.0, effective_radius * k_legacy);
+		mip_w = std::max(mip_f, std::log2(fp_stable * 0.5));
+
+		const PF_FpLong k_floor = k_legacy * (1.0 - Clamp01(s.bokeh_definition));
 		const PF_FpLong fp_floor   = std::max<PF_FpLong>(2.0, effective_radius * k_floor);
 		const PF_FpLong mipf_floor = std::log2(fp_floor * 0.5); // >= 0
 		if (mipf_floor > mip_f) mip_f = mipf_floor;
@@ -2747,15 +2915,27 @@ PassOutput GatherPass(
 		const A_long maxL = pyramid.num_levels - 1;
 		if (mip   > maxL) mip   = maxL;
 		if (mip_f > static_cast<PF_FpLong>(maxL)) mip_f = static_cast<PF_FpLong>(maxL);
+		if (mip_w > static_cast<PF_FpLong>(maxL)) mip_w = static_cast<PF_FpLong>(maxL);
+		if (mip_w < mip_f) mip_w = mip_f;
 	}
 	// Silhouette band: read every colour tap from full-res level 0 so the depth
 	// gate rejects wrong-plane colour before it is averaged (Frischluft parity).
 	// Forcing mip 0 here also disables the anisotropic multi-tap path below,
 	// which requires mip > 0.
+	// The weight LOD follows: a coarse texel straddling the silhouette is an
+	// FG+BG blend, and the band radii are small enough that speckle is not a
+	// risk there anyway.
 	if (fullres_band) {
 		mip = 0;
 		mip_f = 0.0;
+		mip_w = 0.0;
 	}
+	// One extra pyramid fetch per tap, so only pay it where a weight
+	// nonlinearity actually exists AND the two LODs differ enough to matter.
+	const bool weight_lod_split =
+		ZluxWeightLodSplit()
+		&& (has_highlight || has_bokeh_gamma || s.highlight_scatter > 0.001)
+		&& (mip_w > mip_f + 0.05);
 
 	Color3 acc{0.0, 0.0, 0.0};
 	PF_FpLong w_sum = 0.0;        // for color normalization (brightness-weighted)
@@ -2985,10 +3165,19 @@ PassOutput GatherPass(
 			iris = ApplyAstigmatism(iris, u, v, s.astigmatism, s.astigmatism_type_sagittal);
 			pos_uv = {iris.x / anam, iris.y};
 		} else {
-			// Rotate the baked (kx, ky) offset on the unit iris disc.
-			const PF_FpLong kx_r = vs.kx * cos_bn - vs.ky * sin_bn;
-			const PF_FpLong ky_r = vs.kx * sin_bn + vs.ky * cos_bn;
-			pos_uv = {kx_r * pos_coef_x, ky_r * pos_coef_y};
+			// Rotate on the UNSQUASHED disc, then re-apply the anamorphic
+			// squeeze. vs.kx already carries the 1/anamorphic factor, so
+			// rotating it directly is R(theta)*S*v, which rotates the ELLIPSE
+			// itself. Harmless for a circular iris, but with an anamorphic one
+			// every pixel gets its bokeh tilted by its own blue-noise angle and
+			// the blur direction wobbles pixel to pixel -- visible as ribbing
+			// along edges. S*R*v keeps the ellipse fixed and moves only the
+			// samples, which is all the rotation was ever meant to do.
+			const PF_FpLong anam_n = std::max<PF_FpLong>(0.1, s.anamorphic_ratio);
+			const PF_FpLong kxu = vs.kx * anam_n;      // back to cos_a * fr
+			const PF_FpLong rx  = kxu * cos_bn - vs.ky * sin_bn;
+			const PF_FpLong ry  = kxu * sin_bn + vs.ky * cos_bn;
+			pos_uv = {(rx / anam_n) * pos_coef_x, ry * pos_coef_y};
 		}
 		PF_FpLong su = u + pos_uv.x;
 		PF_FpLong sv = v + pos_uv.y;
@@ -3177,9 +3366,23 @@ PassOutput GatherPass(
 			col = SampleMipTrilinear(pyramid, mip_f, su, sv);
 		}
 
+		// ── Weighting colour: a SEPARATE, deliberately steadier LOD ─────────
+		// Everything below this line that touches `w` is a nonlinearity in the
+		// sample's brightness -- boost multiplies by luma, bokeh gamma raises a
+		// power of it, the scatter mask is a hard-ish threshold on it. Feeding
+		// those a razor-sharp mip means one blown texel inside an otherwise dull
+		// neighbourhood grabs a huge share of the weighted average and fires as a
+		// crawling speckle; that is what the old blanket footprint floor existed
+		// to suppress, at the cost of every bokeh edge in the frame. Reading the
+		// WEIGHT from the coarse, stable LOD and the COLOUR from the sharp one
+		// separates the two concerns: weights vary smoothly across the disc while
+		// the disc itself keeps a hard edge.
+		const Color3 wcol = weight_lod_split
+			? SampleMipTrilinear(pyramid, mip_w, su, sv)
+			: col;
 		// Cache luma once; used by highlight boost, bokeh gamma, and the
 		// sprite-scatter threshold gate so we never recompute it.
-		const PF_FpLong sample_luma = Luma(col);
+		const PF_FpLong sample_luma = Luma(wcol);
 
 		if (has_highlight) {
 			// DOF PRO's "punchy bokeh" signature comes from preserving the
@@ -3211,8 +3414,9 @@ PassOutput GatherPass(
 
 		if (preservative) {
 			// Same specular test as the additive path, but it scales the tap's
-			// weight rather than feeding a separate accumulator.
-			const PF_FpLong sf = ComputeHighlightMask(col, s);
+			// weight rather than feeding a separate accumulator -- so it reads
+			// the stable LOD too.
+			const PF_FpLong sf = ComputeHighlightMask(wcol, s);
 			if (sf > 0.001) w *= 1.0 + s.highlight_scatter * kPreserveGain * sf;
 		}
 
@@ -3239,7 +3443,9 @@ PassOutput GatherPass(
 		// the additive layer never brightens mid-tones -- only the sample
 		// positions that the user considers "specular" splat into spec_acc.
 		if (additive_scatter) {
-			const PF_FpLong spec_factor = ComputeHighlightMask(col, s);
+			// Threshold on the stable LOD (it is a weight decision); the energy
+			// that gets splatted is still the sharp colour.
+			const PF_FpLong spec_factor = ComputeHighlightMask(wcol, s);
 			if (spec_factor > 0.001) {
 				const PF_FpLong sw = mask * gate * spec_factor;
 				spec_acc.r += col.r * sw;
@@ -3556,6 +3762,51 @@ static const LensPreset g_lens_presets[] = {
 	// trailing tail, green/magenta projection fringe and a warm-gold flare tint.
 	// The closest thing to a sci-fi cine look this plugin can throw.
 	/*Anamorphic Comet*/ {2, 1, 6, 20, 0, 16, 60, 1.55, 125, 0, 2.00, 16, 40,  0, 24,  0, 0, 0, 255, 232, 198, 16, 0.95, 18,  0,  0, 45},
+
+	// ── v3.1: gaps in the lineup ───────────────────────────────────────────
+	// Each of these occupies an optical axis the list above did not reach --
+	// checked against the existing entries rather than added for the count.
+	//      shp apmap bld curv ntch soft  vig vigsc astig sag aspect   sa sasc  carc cagm caby cata cscl   R    G    B  blm   bg  sct onion fcrv fswt
+
+	// Sony 135/2.8 [T4.5] STF -- the apodization lens. A radially graded ND
+	// element inside the barrel makes the disc fade to nothing at its rim, so
+	// there is no bokeh EDGE at all. Nothing above does this: the softest entry
+	// was Mir-1V at 70, and it spends that softness alongside heavy swirl and
+	// fringing. Here softness is the whole point and everything else is near
+	// zero -- the smoothest defocus ever put in a lens.
+	/*Sony 135 STF (Apod.)*/ {1, 1, 9, 100, 0, 92,  8, 1.10,   0, 0, 1.00,   5, 40,  0,  0,  0, 0,  0, 255, 255, 255, 0, 0.75,  0,  0,  0, 45},
+	// Cooke S4/i -- "the Cooke Look". Rounded 8-blade cine prime, deliberately
+	// left slightly UNDERcorrected so highlights bloom into their discs rather
+	// than ringing, with a warm cast. The counterpoint to the Sigma Art above,
+	// which is the same cleanliness taken the other way (overcorrected, neutral).
+	/*Cooke S4/i (Cine)*/    {2, 1, 8,  85, 0, 28, 32, 1.25,   6, 0, 1.00, -18, 45,  4,  0, -4, 0,  0, 255, 246, 232, 0, 0.90,  8,  0,  0, 45},
+	// CCTV 25/1.4 C-mount -- the cheap security lens adapted to mirrorless. Hard
+	// hexagonal iris (no blade rounding), violent swirl and vignetting, fringing
+	// nobody corrected. Distinct from the Cyclop, whose swirl comes from a
+	// bladeless CIRCULAR aperture and stays soft: this one is all hard edges.
+	/*CCTV 25mm f/1.4*/      {2, 1, 6, -10, 0,  8, 90, 1.85, 120, 0, 1.00,  45, 55, 18,  0,-18, 0,  0, 255, 252, 245, 0, 1.10, 20,  8, 25, 35},
+	// Rodenstock Imagon -- the classic portrait soft-focus head. Extreme
+	// UNDERcorrected spherical aberration wraps every highlight in a glowing
+	// halo instead of a disc. Same axis as the Lensbaby Velvet above but taken
+	// to the end of it (-92/72 against -70/45), which is a different look rather
+	// than a stronger one: the disc stops reading as a disc.
+	/*Rodenstock Imagon*/    {1, 1,12, 100, 0, 72, 15, 1.15,   0, 0, 1.00, -92, 72,  0,  6,  0, 0,  0, 255, 250, 244, 0, 0.78,  0,  0,  0, 45},
+	// Reflex 1000mm -- the BAD mirror lens, as against the MTO-500 above. Same
+	// central obstruction, but the cheap catadioptrics stack a coarse machining
+	// texture and real astigmatism on top, so the donuts swirl and ring instead
+	// of sitting clean. The reason mirror bokeh has the reputation it does.
+	/*Reflex 1000 (Donut)*/  {1, 1, 6, 100, 0, 20,  0, 1.00,  60, 0, 1.00,  12, 50,  0,  0,  0, 1, 92, 255, 255, 255, 0, 1.15, 28, 42,  0, 45},
+	// Angenieux 25-250 -- the vintage cine zoom. Its element count is what makes
+	// it: every ground surface prints another ring, so the onion structure is far
+	// heavier than the Helios's machining marks (55 against 18), over a moderate
+	// swirl and the cool cast of the old coatings.
+	/*Angenieux 25-250*/     {1, 1, 9,  60, 0, 22, 58, 1.45,  35, 0, 1.00,  28, 45,  6,  8,  0, 0,  0, 246, 250, 255, 0, 1.00, 18, 55,  0, 45},
+	// Tilt-Shift Miniature -- not a lens but the toy-town rig, and the one use
+	// of Field Curvature the entries above do not cover: they all pair it with
+	// heavy astigmatism to get streaks. This is pure depth-independent edge
+	// blur with a tight sweet spot and clean optics, which is what reads as
+	// "miniature" rather than "broken lens".
+	/*Tilt-Shift Miniature*/ {1, 1, 9, 100, 0, 15, 20, 1.15,   0, 0, 1.00,   8, 40,  0,  0,  0, 0,  0, 255, 255, 255, 0, 0.95, 12,  0, 95, 22},
 };
 
 // Writes a preset's values into the live param sliders (so they show up in the
@@ -3625,6 +3876,10 @@ struct RenderRefcon {
 	// was originally meant to drive.
 	PF_EffectWorld* iris_mod_world;
 	const DOFSettings* settings;
+	// The frame's aperture-map snapshot. Borrowed; RenderCore owns the
+	// shared_ptr that keeps it alive for the whole render, which is what lets
+	// the worker threads read it without locking.
+	const zlux_apmap::ApMap* apmap;
 	const PF_FpLong* raw_depth_cache;
 	const float* depth_cache;
 	const float* signed_coc_cache;
@@ -3999,12 +4254,30 @@ inline std::atomic<bool>& Disabled()
 // costs little: the depth preprocessing and the composite (the other ~70 ms)
 // still run fully in parallel across MFR threads, and the GPU is far from
 // saturated at ~27 gathers/second.
+// Deliberately NOT `static ZluxGpuContext* c = zluxGpuCreate();`. A function-
+// local static runs its initialiser exactly once for the life of the process,
+// so once Shutdown() nulled the slot the context could never come back: Ctx()
+// returned null forever, the caller latched Disabled(), and every later render
+// fell to the CPU gather. After Effects does pair GlobalSetup/GlobalSetdown more
+// than once per session (reloading effects, purging), which made that reachable.
 inline ZluxGpuContext*& CtxSlot()
 {
-	static ZluxGpuContext* c = zluxGpuCreate();
+	static ZluxGpuContext* c = nullptr;
 	return c;
 }
-inline ZluxGpuContext* Ctx() { return CtxSlot(); }
+
+// Creates the context on first use. MUST be called with DeviceMutex held --
+// zluxGpuCreate is not reentrant and the slot is shared across MFR threads.
+inline ZluxGpuContext* CtxLocked()
+{
+	ZluxGpuContext*& c = CtxSlot();
+	if (!c) c = zluxGpuCreate();
+	return c;
+}
+
+// Non-creating peek, for callers that only want to touch a context that already
+// exists (the result-set release guard). Never resurrects the device.
+inline ZluxGpuContext* CtxIfAlive() { return CtxSlot(); }
 
 // ── Crash breadcrumbs ───────────────────────────────────────────────────────
 // The GPU path crashed inside After Effects while running clean in the
@@ -4034,22 +4307,24 @@ inline void Trace(const char* stage, long long a = -1, long long b = -1)
 // Serialises device access across MFR render threads. Held for the whole
 // upload -> launch -> readback sequence, because the context's buffers are
 // single-instance.
-// Releases the device context. Safe to call when nothing was ever created.
-inline void Shutdown();
-
 inline std::mutex& DeviceMutex()
 {
 	static std::mutex m;
 	return m;
 }
 
+// Releases the device context. Safe to call when nothing was ever created, and
+// safe to call more than once: the next render recreates the context through
+// CtxLocked(). Clearing the failure latch is part of that -- a teardown is not
+// evidence of a bad device, and leaving it set would make the reload permanent.
 inline void Shutdown()
 {
 	std::lock_guard<std::mutex> lk(DeviceMutex());
-	if (ZluxGpuContext* c = Ctx()) {
+	if (ZluxGpuContext* c = CtxSlot()) {
 		zluxGpuDestroy(c);
 		CtxSlot() = nullptr;
 	}
+	Disabled().store(false, std::memory_order_relaxed);
 }
 
 inline bool RunGather(const ZluxGatherParams& gp,
@@ -4064,10 +4339,11 @@ inline bool RunGather(const ZluxGatherParams& gp,
                       const std::vector<CoCTileData>& tiles,
                       A_long tiles_x, A_long out_w, A_long out_h,
                       PF_FpLong inv_w, PF_FpLong inv_h,
-                      std::unique_ptr<float4_gpu[]>& out_far,
-                      std::unique_ptr<float4_gpu[]>& out_near,
-                      std::unique_ptr<float4_gpu[]>& out_bleed,
-                      std::unique_ptr<float4_gpu[]>& out_matte)
+                      const float4_gpu*& out_far,
+                      const float4_gpu*& out_near,
+                      const float4_gpu*& out_bleed,
+                      const float4_gpu*& out_matte,
+                      int& out_slot)
 {
 #ifdef ZLUX_PROFILE
 	auto t_enter = std::chrono::steady_clock::now();
@@ -4078,19 +4354,30 @@ inline bool RunGather(const ZluxGatherParams& gp,
 	// single-frame harness run is not mistaken for steady-state cost.
 	Trace("enter", out_w, out_h);
 	if (Disabled().load(std::memory_order_relaxed)) return false;
-	ZluxGpuContext* ctx = Ctx();
-	if (!ctx) { Disabled().store(true, std::memory_order_relaxed); return false; }
 
-	// Any CUDA failure below latches the GPU path off for the session. Wrapped in
-	// a helper so every early return goes through it -- a silent `return false`
-	// would retry the same failing device on the next frame.
+	// A genuine DEVICE failure below latches the GPU path off for the session.
+	// Wrapped in a helper so every early return goes through it -- a silent
+	// `return false` would retry the same failing device on the next frame.
+	//
+	// A TRANSIENT failure must not latch. The only one is ZLUX_GPU_BUSY: every
+	// pooled result set is held by a concurrently compositing frame, which is
+	// ordinary MFR contention on a many-core machine and clears by itself. It
+	// used to latch, so one busy moment silently dropped the rest of the session
+	// to the CPU gather (~10x slower) with nothing but the panel badge to say so.
+	// Disarm via latch.excuse() for those.
 	struct Latch {
 		bool tripped = true;
+		void excuse() { tripped = false; }
 		~Latch() { if (tripped) Disabled().store(true, std::memory_order_relaxed); }
 	} latch;
 	// Everything from here to the readback touches the shared device buffers.
 	std::lock_guard<std::mutex> device_lock(DeviceMutex());
 	Trace("lock acquired");
+
+	// Under the lock: CtxLocked() may create the context, and two MFR threads
+	// arriving together must not both run zluxGpuCreate.
+	ZluxGpuContext* ctx = CtxLocked();
+	if (!ctx) { Trace("FAIL ctx"); return false; }
 
 	const size_t n = static_cast<size_t>(out_w) * static_cast<size_t>(out_h);
 #ifdef ZLUX_PROFILE
@@ -4157,6 +4444,12 @@ inline bool RunGather(const ZluxGatherParams& gp,
 	// Aperture layers + the per-bokeh rotation table. Uploaded every frame: the
 	// layers are small and may be animated, and re-uploading is far cheaper than
 	// tracking their validity.
+	//
+	// The results are CHECKED. They used to be discarded, so a failed upload left
+	// the previous frame's iris texture bound and the gather quietly rendered the
+	// wrong aperture -- the one outcome the GPU path is supposed to make
+	// impossible, since its whole contract is that enabling a GPU never changes
+	// output. A failure here is a device error, so it latches like any other.
 	{
 		float rot[256];
 		for (int i = 0; i < 128; ++i) {
@@ -4164,15 +4457,21 @@ inline bool RunGather(const ZluxGatherParams& gp,
 			rot[i * 2 + 1] = static_cast<float>(kBokehRotLUT[i].second);
 		}
 		std::vector<float> lum;
+		int arc;
 		if (aperture_tex_world && ApertureLayerToLuma(aperture_tex_world, lum)) {
-			zluxGpuUploadApertureTex(ctx, 0, lum.data(),
-			                         aperture_tex_world->width, aperture_tex_world->height, rot);
+			arc = zluxGpuUploadApertureTex(ctx, 0, lum.data(),
+			                               aperture_tex_world->width, aperture_tex_world->height, rot);
 		} else {
-			zluxGpuUploadApertureTex(ctx, 0, nullptr, 0, 0, rot);
+			arc = zluxGpuUploadApertureTex(ctx, 0, nullptr, 0, 0, rot);
 		}
+		if (arc != ZLUX_GPU_OK) { Trace("FAIL aptex0"); return false; }
+
 		if (iris_mod_world && ApertureLayerToLuma(iris_mod_world, lum)) {
-			zluxGpuUploadApertureTex(ctx, 1, lum.data(),
-			                         iris_mod_world->width, iris_mod_world->height, nullptr);
+			if (zluxGpuUploadApertureTex(ctx, 1, lum.data(),
+			                             iris_mod_world->width, iris_mod_world->height,
+			                             nullptr) != ZLUX_GPU_OK) {
+				Trace("FAIL aptex1"); return false;
+			}
 		}
 	}
 
@@ -4192,7 +4491,16 @@ inline bool RunGather(const ZluxGatherParams& gp,
 	F.bleed_radius  = nullptr;
 	F.center_depth  = depth_cache.data();
 	Trace("upload fields");
-	if (zluxGpuUploadFields(ctx, &gp, &F) != 0) { Trace("FAIL fields"); return false; }
+	{
+		// Can report BUSY when the device is simply short of free VRAM this
+		// instant (see the cudaMemGetInfo guard in zluxGpuUploadFields).
+		const int frc = zluxGpuUploadFields(ctx, &gp, &F);
+		if (frc != ZLUX_GPU_OK) {
+			if (frc == ZLUX_GPU_BUSY) { Trace("BUSY fields"); latch.excuse(); }
+			else                      { Trace("FAIL fields"); }
+			return false;
+		}
+	}
 	lap("upload fields");
 
 	Trace("radii (gpu)");
@@ -4220,38 +4528,25 @@ inline bool RunGather(const ZluxGatherParams& gp,
 
 	float kernel_ms = 0.0f;
 	Trace("launch");
-	if (zluxGpuGather(ctx, &gp, &O, &kernel_ms) != 0) { Trace("FAIL gather"); return false; }
-	Trace("gather ok");
-	latch.tripped = false;   // full success -- keep the GPU path armed
-
-	// Take a per-frame copy while the device lock is still held.
-	//
-	// O.* point into the CONTEXT's pinned staging buffers, which the next frame
-	// will overwrite -- and, on a resolution change, cudaFreeHost outright. After
-	// Effects renders several frames concurrently (MFR) and at different sizes
-	// (comp view plus the Effect Controls thumbnail), so handing those pointers
-	// to the compositor, which reads them after this function returns and the
-	// lock is released, is a use-after-free. The pinned buffers stay worthwhile:
-	// they make the device->host transfer ~8x faster, and this host->host copy is
-	// a straight memcpy of already-resident pages.
-	//
-	// `new float4_gpu[n]` default-initializes a trivial type, i.e. leaves it
-	// uninitialized -- deliberately, so this does not reintroduce the ~95 MB of
-	// zero-fill per frame that std::vector::resize was costing.
-	out_far  .reset(new float4_gpu[n]);
-	out_near .reset(new float4_gpu[n]);
-	out_bleed.reset(new float4_gpu[n]);
-	std::memcpy(out_far  .get(), O.far_rgba,   n * sizeof(float4_gpu));
-	std::memcpy(out_near .get(), O.near_rgba,  n * sizeof(float4_gpu));
-	std::memcpy(out_bleed.get(), O.bleed_rgba, n * sizeof(float4_gpu));
-	if (gp.has_alpha) {
-		out_matte.reset(new float4_gpu[n]);
-		std::memcpy(out_matte.get(), O.mattes, n * sizeof(float4_gpu));
+	const int grc = zluxGpuGather(ctx, &gp, &O, &kernel_ms);
+	if (grc != ZLUX_GPU_OK) {
+		// BUSY means the device is healthy and simply out of free result sets;
+		// this frame goes to the CPU and the next one retries the GPU.
+		if (grc == ZLUX_GPU_BUSY) { Trace("BUSY gather"); latch.excuse(); }
+		else                      { Trace("FAIL gather"); }
+		return false;
 	}
-	lap("kernel+readback");
-#ifdef ZLUX_PROFILE
-	std::fprintf(stderr, "  [prof] cuda kernel        %8.1f ms\n", kernel_ms);
-#endif
+	Trace("gather ok");
+	latch.excuse();   // full success -- keep the GPU path armed
+
+	// The pool hands this frame its own page-locked set, so the compositor can
+	// read it after the device lock drops without the next frame overwriting it
+	// -- and without the ~75 MB host-to-host copy the previous fix needed.
+	out_far   = reinterpret_cast<const float4_gpu*>(O.far_rgba);
+	out_near  = reinterpret_cast<const float4_gpu*>(O.near_rgba);
+	out_bleed = reinterpret_cast<const float4_gpu*>(O.bleed_rgba);
+	out_matte = reinterpret_cast<const float4_gpu*>(O.mattes);
+	out_slot  = O.slot;
 	Trace("copied out");
 	return true;
 }
@@ -4785,8 +5080,8 @@ static PF_Err RenderPixelImpl(void* refcon, A_long x, A_long y, PIX* inP, PIX* o
 							}
 						}
 						// Built-in aperture-map library shape.
-						if (local.aperture_map_index > 0 && zlux_apmap::Active()) {
-							m2 *= zlux_apmap::Sample(cp2.x, cp2.y);
+						if (local.aperture_map_index > 0 && zlux_apmap::Active(r->apmap)) {
+							m2 *= zlux_apmap::Sample(r->apmap, cp2.x, cp2.y);
 						}
 						// Iris Texture modulator (any shape mode).
 						if (r->iris_mod_world && local.aperture_shape_mode != 4) {
@@ -4850,8 +5145,8 @@ static PF_Err RenderPixelImpl(void* refcon, A_long x, A_long y, PIX* inP, PIX* o
 				}
 			}
 			// Built-in aperture-map library shape (same bake as the gather).
-			if (local.aperture_map_index > 0 && zlux_apmap::Active()) {
-				m *= zlux_apmap::Sample(cp.x, cp.y);
+			if (local.aperture_map_index > 0 && zlux_apmap::Active(r->apmap)) {
+				m *= zlux_apmap::Sample(r->apmap, cp.x, cp.y);
 			}
 			if (r->iris_mod_world && local.aperture_shape_mode != 4) {
 				m *= SampleApertureTextureMask(r->iris_mod_world, cp, field_u, field_v, local);
@@ -5038,7 +5333,13 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 	// Load the selected built-in aperture-map shape once, up front (single-
 	// threaded), so it is available to BOTH the gather bake and the Iris /
 	// Iris-Array preview display modes regardless of the active mode.
-	zlux_apmap::EnsureApMapLoaded(local.aperture_map_index);
+	// One snapshot for the whole frame, taken up front and held by this
+	// shared_ptr until RenderCore returns. Everything downstream -- the Vogel
+	// bake, the per-pixel gather on every worker thread, the Iris display modes
+	// -- reads through this borrowed pointer, so a concurrent render of another
+	// instance loading a DIFFERENT map cannot disturb it.
+	const zlux_apmap::ApMapRef apmap_ref = zlux_apmap::LoadApMap(local.aperture_map_index);
+	const zlux_apmap::ApMap* const apmap = apmap_ref.get();
 
 	const A_long tiles_x = (out_w + kCocTileSize - 1) / kCocTileSize;
 	const A_long tiles_y = (out_h + kCocTileSize - 1) / kCocTileSize;
@@ -5085,9 +5386,9 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 	// so every pixel still gets AT LEAST the tap count the quality model asked
 	// for -- only the overshoot shrinks. Heap-allocated: 13 LUTs x 72KB on the
 	// stack would risk overflowing AE's render-thread stack.
-	constexpr A_long kNumVogelLUTs = 13;
+	constexpr A_long kNumVogelLUTs = 15;
 	static const A_long kVogelLUTSizes[kNumVogelLUTs] =
-		{16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024};
+		{16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048};
 	std::vector<VogelLUT> vogel_luts_store;
 
 	if (needs_depth) {
@@ -5736,7 +6037,46 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 			});
 		}
 
+		// ── Depth-field filters on the GPU ─────────────────────────────────
+		// Boundary snap, despeckle and declutter run back to back over the same
+		// CoC field, so one call does all three with a single upload/download
+		// instead of three round trips. Each stage keeps its CPU implementation
+		// below; ZLUX_CPUSNAP / ZLUX_CPUSPECK / ZLUX_CPUDECL force any of them
+		// back so they can be A/B'd individually against the reference.
+		bool zlux_snap_on_gpu = false, zlux_speck_on_gpu = false,
+		     zlux_depth_filters_on_gpu = false;
+#ifdef ZLUX_CUDA
+		if (!local.no_depth && zlux_gpu::Enabled()) {
+			static const bool kCpuSnap  = (std::getenv("ZLUX_CPUSNAP")  != nullptr);
+			static const bool kCpuSpeck = (std::getenv("ZLUX_CPUSPECK") != nullptr);
+			static const bool kCpuDecl  = (std::getenv("ZLUX_CPUDECL")  != nullptr);
+			if (!(kCpuSnap && kCpuSpeck && kCpuDecl)) {
+				// Lock BEFORE asking for the context: CtxLocked() may create it,
+				// and the creation itself has to be serialised across MFR threads.
+				std::lock_guard<std::mutex> lk(zlux_gpu::DeviceMutex());
+				if (ZluxGpuContext* dctx = zlux_gpu::CtxLocked()) {
+					std::vector<float> protect_f(static_cast<size_t>(pixel_count));
+					for (size_t i = 0; i < protect_f.size(); ++i)
+						protect_f[i] = static_cast<float>(protect_mask_cache[i]);
+					std::vector<float> filtered(static_cast<size_t>(pixel_count));
+					if (zluxGpuDepthFilters(dctx, signed_coc_cache.data(), protect_f.data(),
+					                        out_w, out_h,
+					                        kCpuSnap  ? 0 : 1,
+					                        kCpuSpeck ? 0 : 1,
+					                        kCpuDecl  ? 0 : 1,
+					                        filtered.data()) == 0) {
+						signed_coc_cache.swap(filtered);
+						zlux_snap_on_gpu           = !kCpuSnap;
+						zlux_speck_on_gpu          = !kCpuSpeck;
+						zlux_depth_filters_on_gpu  = !kCpuDecl;
+					}
+				}
+			}
+		}
+#endif
+
 		// ── Occlusion-boundary snap (real-lens edge model) ──────────────
+		if (!zlux_snap_on_gpu)
 		// A real foreground object has a hard geometric edge: its defocus
 		// disc spreads OUTWARD at full strength starting exactly at the
 		// silhouette, and nothing "fades" across the boundary. AI depth
@@ -5812,6 +6152,7 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 		ZLUX_PROF("boundary snap");
 
 		// ── Isolated-focus-speck suppression ────────────────────────────────
+		if (!zlux_speck_on_gpu)
 		// Real depth sources are noisy exactly where it hurts most: a renderer
 		// writes EITHER the glass surface's Z OR the background's Z per pixel
 		// on semi-transparent / reflective surfaces, AI depth passes jitter,
@@ -5909,7 +6250,7 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 		//   * a region EDGE (≈50% blur) -> frac≈0.5 < gate -> untouched
 		//   * an already-blurred pixel -> relU≈0 -> untouched
 		// Near foreground (negative CoC) and Edge-Protect'd pixels are skipped.
-		if (!local.no_depth) {
+		if (!local.no_depth && !zlux_depth_filters_on_gpu) {
 			const size_t Nc = signed_coc_cache.size();
 			const A_long boxR = 6;                      // 13x13 window
 			const PF_FpLong box_area = static_cast<PF_FpLong>((2 * boxR + 1) * (2 * boxR + 1));
@@ -6113,7 +6454,7 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 		vogel_luts_store.resize(static_cast<size_t>(kNumVogelLUTs));
 		for (A_long li = 0; li < kNumVogelLUTs; ++li) {
 			BuildVogelLUT(vogel_luts_store[static_cast<size_t>(li)], kVogelLUTSizes[li], local.bokeh_rotation_rad);
-			FinalizeVogelLUT(vogel_luts_store[static_cast<size_t>(li)], local);
+			FinalizeVogelLUT(vogel_luts_store[static_cast<size_t>(li)], local, apmap);
 		}
 	} else {
 		coc_tiles_dilated.resize(static_cast<size_t>(tiles_x * tiles_y));
@@ -6222,8 +6563,25 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 	const auto gather_t0 = std::chrono::steady_clock::now();
 	// Owned by the CUDA context's pinned staging buffers, valid until the next
 	// gather on the same context (which the device mutex serialises).
-	std::unique_ptr<float4_gpu[]> gpu_far, gpu_near, gpu_bleed, gpu_matte;
+	// Borrowed from the CUDA context's pinned result pool; handed back at the
+	// end of RenderCore by the guard below.
+	const float4_gpu *gpu_far = nullptr, *gpu_near = nullptr,
+	                 *gpu_bleed = nullptr, *gpu_matte = nullptr;
+	int  gpu_slot = -1;
 	bool gpu_active = false;
+#ifdef ZLUX_CUDA
+	// Returns the pooled set no matter how RenderCore exits; leaking one would
+	// shrink the pool until every later frame fell back to the CPU.
+	struct GpuResultGuard {
+		int* slot;
+		~GpuResultGuard() {
+			// CtxIfAlive, not CtxLocked: releasing a slot must never resurrect a
+			// context that Shutdown() just tore down (and we hold no device lock
+			// here, so creating one would race).
+			if (*slot >= 0) { zluxGpuReleaseResults(zlux_gpu::CtxIfAlive(), *slot); *slot = -1; }
+		}
+	} gpu_result_guard{&gpu_slot};
+#endif
 #ifdef ZLUX_CUDA
 	if (needs_bokeh && pyramid.num_levels > 0 && zlux_gpu::Enabled()) {
 		ZluxGatherParams gp{};
@@ -6244,6 +6602,7 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 		gp.focal_distance = static_cast<float>(local.focal_distance);
 		gp.anamorphic_ratio = static_cast<float>(local.anamorphic_ratio);
 		gp.highlight_boost = static_cast<float>(local.highlight_boost);
+		gp.bokeh_definition = static_cast<float>(local.bokeh_definition);
 		gp.bokeh_gamma = static_cast<float>(local.bokeh_gamma);
 		gp.highlight_scatter = static_cast<float>(local.highlight_scatter);
 		gp.highlight_mode = local.highlight_mode;
@@ -6275,7 +6634,7 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 			                                 signed_coc_cache, coc_disc_dist,
 			                                 depth_cache, coc_tiles_dilated,
 			                                 tiles_x, out_w, out_h, inv_w, inv_h,
-			                                 gpu_far, gpu_near, gpu_bleed, gpu_matte);
+			                                 gpu_far, gpu_near, gpu_bleed, gpu_matte, gpu_slot);
 		}
 	}
 #endif // ZLUX_CUDA
@@ -6465,6 +6824,7 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 	rc.aperture_tex_world = aperture_tex_world;
 	rc.iris_mod_world = iris_mod_world;
 	rc.settings = &local;
+	rc.apmap = apmap;
 	rc.raw_depth_cache = raw_depth_cache.data();
 	rc.depth_cache = depth_cache.data();
 	rc.signed_coc_cache = signed_coc_cache.data();
@@ -6478,10 +6838,10 @@ PF_Err RenderCore(PF_InData* in_data, PF_OutData* out_data, PF_EffectWorld* src_
 	// which case every gather call site below falls back to GatherPass.
 	if (gpu_active) {
 		zlux_gpu::Trace("RC: wiring refcon");
-		rc.gpu_far   = gpu_far.get();
-		rc.gpu_near  = gpu_near.get();
-		rc.gpu_bleed = gpu_bleed.get();
-		rc.gpu_matte = gpu_matte.get();
+		rc.gpu_far   = gpu_far;
+		rc.gpu_near  = gpu_near;
+		rc.gpu_bleed = gpu_bleed;
+		rc.gpu_matte = gpu_matte;
 	}
 	rc.far_halfres = far_halfres.empty() ? nullptr : far_halfres.data();
 	rc.far_alpha_halfres = far_alpha_halfres.empty() ? nullptr : far_alpha_halfres.data();
@@ -6563,9 +6923,14 @@ static PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 	// shape, which breaks on adjustment layers (error 25::237). All gather
 	// offsets clamp to edge during sampling, so no extra input context is
 	// needed beyond what AE already guarantees.
+	// No PF_OutFlag_PIX_INDEPENDENT either. It asserts that an output pixel does
+	// not depend on the pixels around it, which lets AE leave the rows it does
+	// not need (during field rendering) filled with garbage -- and zluxDOF is a
+	// gather over a disc that can be tens of pixels wide, so it reads exactly
+	// those rows. On an interlaced comp that garbage lands inside the bokeh. The
+	// flag only ever bought a field-rendering optimisation we cannot use.
 	out_data->out_flags = PF_OutFlag_DEEP_COLOR_AWARE |
 	                     PF_OutFlag_SEND_UPDATE_PARAMS_UI |
-	                     PF_OutFlag_PIX_INDEPENDENT |
 	                     PF_OutFlag_CUSTOM_UI;
 	out_data->out_flags2 = PF_OutFlag2_FLOAT_COLOR_AWARE |
 	                       PF_OutFlag2_SUPPORTS_SMART_RENDER |
@@ -6866,8 +7231,13 @@ static PF_Err DrawBannerImage(const DRAWBOT_Suites& d,
 // that.
 static void RenderBokehThumb(const DOFSettings& s, uint8_t* bgra, int W, int H)
 {
+	// Own snapshot: this runs on the UI thread while renders are in flight, and
+	// it used to share one mutable global with them.
+	const zlux_apmap::ApMapRef apmap_ref = zlux_apmap::LoadApMap(s.aperture_map_index);
+	const zlux_apmap::ApMap* apmap = apmap_ref.get();
+
 	const bool is_poly = (s.aperture_shape_mode == 2 || s.aperture_shape_mode == 3);
-	const bool has_apmap = (s.aperture_map_index > 0) && zlux_apmap::Active();
+	const bool has_apmap = (s.aperture_map_index > 0) && zlux_apmap::Active(apmap);
 	const PF_FpLong anam = std::max<PF_FpLong>(0.1, s.anamorphic_ratio);
 	const PF_FpLong edge_start = 1.0 - (0.02 + s.softness * 0.33);
 	const PF_FpLong ba_rad = kTau / static_cast<PF_FpLong>(std::max<A_long>(3, s.aperture_blades));
@@ -6894,7 +7264,7 @@ static void RenderBokehThumb(const DOFSettings& s, uint8_t* bgra, int W, int H)
 			if (cd >= 1.0) return 0.0;
 			m = 1.0 - SmoothStep(edge_start, 1.0, cd);
 		}
-		if (has_apmap) m *= zlux_apmap::Sample(cp.x, cp.y);
+		if (has_apmap) m *= zlux_apmap::Sample(apmap, cp.x, cp.y);
 		if (s.onion_amount > 0.001)
 			m *= OnionRingMask(ClampValue<PF_FpLong>(cd, 0.0, 1.0), s.onion_amount, s.onion_count);
 		if (s.catadioptric > 0.1) m *= GetCatadioptricMask(cp, s.catadioptric);
@@ -6964,8 +7334,7 @@ static PF_Err DrawBokehPreview(const DRAWBOT_Suites& d,
 	s.ca_by = ClampValue<PF_FpLong>(params[ZLUXDOF_CA_BLUE_YELLOW]->u.fs_d.value * 0.012, -1.2, 1.2);
 	s.focal_distance = 0.5;
 
-	zlux_apmap::EnsureApMapLoaded(s.aperture_map_index);
-
+	// RenderBokehThumb takes its own snapshot; nothing to preload here.
 	const int W = 200, H = 200;
 	std::vector<uint8_t> buf(static_cast<size_t>(W) * H * 4);
 	RenderBokehThumb(s, buf.data(), W, H);
@@ -7649,7 +8018,16 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 	AEFX_CLR_STRUCT(def); PF_ADD_POPUP(STR(StrID_Aspect_Preset), 10, 1, STR(StrID_Aspect_Preset_Choices), ASPECT_PRESET_DISK_ID);
 	AEFX_CLR_STRUCT(def); PF_ADD_FLOAT_SLIDERX(STR(StrID_Aspect_Ratio), 0.0f, 4.0f, 0.0f, 4.0f, 1.0f, PF_Precision_HUNDREDTHS, 0, 0, ASPECT_RATIO_DISK_ID);
 	AEFX_CLR_STRUCT(def); PF_ADD_FLOAT_SLIDERX(STR(StrID_Aperture_Size), 0.0f, 100.0f, 0.0f, 100.0f, 15.0f, PF_Precision_HUNDREDTHS, 0, 0, APERTURE_SIZE_DISK_ID);
-	AEFX_CLR_STRUCT(def); PF_ADD_FLOAT_SLIDERX(STR(StrID_Sample_Count), 16.0f, 1024.0f, 16.0f, 1024.0f, 256.0f, PF_Precision_INTEGER, 0, 0, SAMPLE_COUNT_DISK_ID);
+	AEFX_CLR_STRUCT(def); PF_ADD_FLOAT_SLIDERX(STR(StrID_Sample_Count), 16.0f, 2048.0f, 16.0f, 2048.0f, 256.0f, PF_Precision_INTEGER, 0, 0, SAMPLE_COUNT_DISK_ID);
+	// Bokeh Definition: how crisp a bokeh disc's edge is allowed to be. The
+	// gather reads its colour from a MIP pyramid, and the footprint it reads at
+	// is floored at a fraction of the blur radius; a point light is therefore
+	// pre-blurred by that footprint before the aperture mask ever integrates it,
+	// so the floor IS the disc's edge width. 0% = the v3.0 floor (35% of the
+	// radius, creamy); 100% = no floor at all, leaving the Vogel inter-sample
+	// spacing as the only limit (hard-edged, "bokeh balls"). Raise Sample Quality
+	// alongside it -- the spacing is what caps definition once the floor is gone.
+	AEFX_CLR_STRUCT(def); PF_ADD_FLOAT_SLIDERX(STR(StrID_Bokeh_Definition), 0.0f, 100.0f, 0.0f, 100.0f, 65.0f, PF_Precision_HUNDREDTHS, 0, 0, BOKEH_DEFINITION_DISK_ID);
 	// Energy-Conserving (Physical) Bokeh: normalize the gather by geometric
 	// coverage instead of the brightness-weighted sum -- a true linear-light
 	// average that matches a real lens / 3D render and removes the firefly grain
@@ -7738,7 +8116,11 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 	//                   the brightest sample, exposure and dynamic range are
 	//                   preserved, and the highlight is concentrated by
 	//                   redistributing energy rather than inventing it.
-	AEFX_CLR_STRUCT(def); PF_ADD_POPUP(STR(StrID_Highlights_Mode), 2, 1, STR(StrID_Highlights_Mode_Choices), HIGHLIGHTS_MODE_DISK_ID);
+	// v3.1: Preservative is the DEFAULT. Additive shipped as the default only
+	// because it was the historical behaviour; it invents energy, and paired with
+	// the crisper gather this release brings that reads as clipped white cores
+	// where Preservative keeps the disc's colour and falloff.
+	AEFX_CLR_STRUCT(def); PF_ADD_POPUP(STR(StrID_Highlights_Mode), 2, 2, STR(StrID_Highlights_Mode_Choices), HIGHLIGHTS_MODE_DISK_ID);
 	AEFX_CLR_STRUCT(def); PF_ADD_FLOAT_SLIDERX(STR(StrID_Highlights_Recovery), 0.0f, 100.0f, 0.0f, 100.0f, 65.0f, PF_Precision_HUNDREDTHS, 0, 0, HIGHLIGHTS_RECOVERY_DISK_ID);
 	AEFX_CLR_STRUCT(def); PF_ADD_COLOR(STR(StrID_Highlights_Tint), PF_MAX_CHAN8, PF_MAX_CHAN8, PF_MAX_CHAN8, HIGHLIGHTS_TINT_DISK_ID);
 	AEFX_CLR_STRUCT(def); PF_END_TOPIC(HIGHLIGHTS_GROUP_END_DISK_ID);
@@ -7950,7 +8332,8 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
 	};
 	s.near_blur_factor = ClampValue<PF_FpLong>(DecodeSlider(params[ZLUXDOF_DEPTH_NEAR_BLUR]) * 0.01, 0.0, 2.0);
 	s.foreground_protect = Clamp01(DecodeSlider(params[ZLUXDOF_DEPTH_FOREGROUND_PROTECT]) * 0.01);
-	s.sample_count = ClampValue<A_long>(static_cast<A_long>(std::lround(DecodeSlider(params[ZLUXDOF_SAMPLE_COUNT]))), 16, 1024);
+	s.sample_count = ClampValue<A_long>(static_cast<A_long>(std::lround(DecodeSlider(params[ZLUXDOF_SAMPLE_COUNT]))), 16, kMaxVogelSamples);
+	s.bokeh_definition = Clamp01(DecodeSlider(params[ZLUXDOF_BOKEH_DEFINITION]) * 0.01);
 	s.energy_conserving = params[ZLUXDOF_ENERGY_CONSERVING]->u.bd.value;
 	s.matte_top = Clamp01(DecodeSlider(params[ZLUXDOF_MATTEBOX_TOP]) * 0.01);
 	s.matte_bottom = Clamp01(DecodeSlider(params[ZLUXDOF_MATTEBOX_BOTTOM]) * 0.01);
@@ -7980,9 +8363,13 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
 
 	PF_EffectWorld* src_world = &params[ZLUXDOF_INPUT]->u.ld;
 	PF_EffectWorld* effective_depth = has_depth ? depth_world : src_world;
-	const PF_Boolean out_is_float = (output->rowbytes >= static_cast<A_long>(output->width * sizeof(PF_PixelFloat)));
+	// Legacy non-smart entry point: no bitdepth field to consult here, so
+	// WorldIsFloat falls back to its rowbytes heuristic. Left explicit rather
+	// than implicit so it is clear this path is the one that still infers.
+	const ScopedWorkingBpc bpc_scope(0);
+	const PF_Boolean out_is_float = WorldIsFloat(output) ? TRUE : FALSE;
 	err = RenderCore(in_data, out_data, src_world, output, effective_depth, aperture_tex_world, iris_mod_world, s,
-	                 PF_WORLD_IS_DEEP(output), out_is_float && !PF_WORLD_IS_DEEP(output));
+	                 PF_WORLD_IS_DEEP(output), out_is_float);
 
 	PF_Err checkin_err = PF_CHECKIN_PARAM(in_data, &depth_param);
 	PF_Err checkin_custom_err = PF_CHECKIN_PARAM(in_data, &custom_aperture_param);
@@ -8101,7 +8488,8 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
 	CHECKIN_VAL(p_ht);
 	CHECKOUT_VAL(ZLUXDOF_DEPTH_NEAR_BLUR, p_nb); s.near_blur_factor = ClampValue<PF_FpLong>(p_nb.u.fs_d.value * 0.01, 0.0, 2.0); CHECKIN_VAL(p_nb);
 	CHECKOUT_VAL(ZLUXDOF_DEPTH_FOREGROUND_PROTECT, p_fp); s.foreground_protect = Clamp01(p_fp.u.fs_d.value * 0.01); CHECKIN_VAL(p_fp);
-	CHECKOUT_VAL(ZLUXDOF_SAMPLE_COUNT, p_sc); s.sample_count = ClampValue<A_long>(static_cast<A_long>(std::lround(p_sc.u.fs_d.value)), 16, 1024); CHECKIN_VAL(p_sc);
+	CHECKOUT_VAL(ZLUXDOF_SAMPLE_COUNT, p_sc); s.sample_count = ClampValue<A_long>(static_cast<A_long>(std::lround(p_sc.u.fs_d.value)), 16, kMaxVogelSamples); CHECKIN_VAL(p_sc);
+	CHECKOUT_VAL(ZLUXDOF_BOKEH_DEFINITION, p_bdef); s.bokeh_definition = Clamp01(p_bdef.u.fs_d.value * 0.01); CHECKIN_VAL(p_bdef);
 	CHECKOUT_VAL(ZLUXDOF_ENERGY_CONSERVING, p_ec); s.energy_conserving = p_ec.u.bd.value; CHECKIN_VAL(p_ec);
 	CHECKOUT_VAL(ZLUXDOF_MATTEBOX_TOP, p_mt); s.matte_top = Clamp01(p_mt.u.fs_d.value * 0.01); CHECKIN_VAL(p_mt);
 	CHECKOUT_VAL(ZLUXDOF_MATTEBOX_BOTTOM, p_mb); s.matte_bottom = Clamp01(p_mb.u.fs_d.value * 0.01); CHECKIN_VAL(p_mb);
@@ -8195,10 +8583,16 @@ static PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRend
 		const bool sr_has_depth = (depth_worldP && depth_worldP->data);
 		infoP->settings.no_depth = !sr_has_depth;
 		PF_EffectWorld* sr_eff_depth = sr_has_depth ? depth_worldP : input_worldP;
-		const PF_Boolean sr_is_float = (output_worldP->rowbytes >= static_cast<A_long>(output_worldP->width * sizeof(PF_PixelFloat)));
+
+		// AE states the working depth outright; no need to infer it from row
+		// strides (which is ambiguous on very narrow worlds -- see WorldIsFloat).
+		// Publishing it here also makes every WorldIsFloat call below this point,
+		// on any of the checked-out layers, exact.
+		const ScopedWorkingBpc bpc_scope(extraP->input->bitdepth);
+		const PF_Boolean sr_is_float = WorldIsFloat(output_worldP) ? TRUE : FALSE;
+
 		err = RenderCore(in_data, out_data, input_worldP, output_worldP, sr_eff_depth, tex_world, iris_mod_world,
-		                 infoP->settings, PF_WORLD_IS_DEEP(output_worldP),
-		                 sr_is_float && !PF_WORLD_IS_DEEP(output_worldP));
+		                 infoP->settings, PF_WORLD_IS_DEEP(output_worldP), sr_is_float);
 	}
 
 	suites.HandleSuite1()->host_unlock_handle(reinterpret_cast<PF_Handle>(extraP->input->pre_render_data));

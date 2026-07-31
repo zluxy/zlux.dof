@@ -56,3 +56,7 @@ desktop.ini
 # the harness so it can resolve cudart without the toolkit being on PATH.
 debug/*.txt
 debug/*.dll
+debug/__pycache__/
+# Junction to ../aperture_lib, so the harness can resolve ZLUX_APMAP shapes
+# (it has none of the .aex's embedded resources).
+debug/aperture_lib

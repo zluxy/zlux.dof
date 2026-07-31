@@ -1,5 +1,177 @@
 # zluxDOF — Changelog
 
+## v3.1.0 — Bokeh Definition
+
+Bokeh discs get their edge back. This release is about one diagnosis: the gather
+was pre-blurring the source far more than it needed to, and the reason it did
+was not a sampling problem at all.
+
+### The footprint floor was the bokeh edge
+
+The gather reads colour from a MIP pyramid at a level sized so adjacent Vogel
+taps have no gaps between them. On top of that sizing sat a **floor**: the
+footprint could never be smaller than **35% of the blur radius**. At a 48 px
+disc that is a 17 px pre-blur — and since the output for a point light is
+`aperture mask ⊛ pyramid kernel`, that pre-blur *is* the disc's edge gradient.
+The old code's claim that "the edge comes from the aperture mask, not the source
+mip, so discs stay round" was half true: the mask sets the shape, but the mip
+convolves it soft.
+
+The floor existed to suppress a firefly speckle, and the note in the source
+recorded the damning symptom — **more samples made it worse**. That is the
+fingerprint of a *weight* problem, not a *sampling* one: `Bokeh Brightness
+Boost` and `Bokeh Gamma` raise a tap's weight by a power of its luma, so one
+blown texel takes over the weighted average; and a higher tap count drives the
+spacing mip finer, which feeds the weighting sharper texels. The colour never
+needed blurring.
+
+So the two concerns are now separated. The **weight** luma is read at the old,
+deliberately steady 35% LOD; the **colour** is read at the sharp one. Weights
+vary smoothly across the disc while the disc keeps a hard edge.
+
+Measured on a 1280×720 point-light frame, 1024 samples, boost 1.0:
+
+| Bokeh Definition | disc edge (10–90%) | peak brightness | GPU gather |
+|---|---:|---:|---:|
+| 0% (= v3.0) | 14 px | 35.0 | 13.3 ms |
+| 65% (default) | 8 px | 42.2 | 16.6 ms |
+| 100% | **7 px** | **44.2** | 18.1 ms |
+
+The halo that used to bleed outside the disc reads 0 at 100%. Speckle in a
+high-frequency noise field, same frame — the weight-LOD split measured on its
+own (`ZLUX_NOWLOD=1` in profile builds turns it off):
+
+| boost | split off | split on |
+|---|---:|---:|
+| 1.0 | 8.83 | **3.17** |
+| 3.0 | 12.36 | **3.02** |
+
+With the split, speckle no longer depends on the boost at all — which is the
+whole point.
+
+### New control
+
+**Aperture > Bokeh Definition** (0–100%, default 65). 0 reproduces the v3.0
+render exactly. Raise **Sample Quality** alongside it: once the floor is gone
+the Vogel inter-sample spacing is the only limit on how crisp a disc can get.
+
+### Also in this release
+
+- **Highlight Mode now defaults to Preservative.** Additive was the default only
+  because it was the historical behaviour. It accumulates specular taps into an
+  un-normalised bucket layered on top, so a bright point can exceed the source's
+  own peak and clip to flat white — and the crisper gather in this release makes
+  that land harder, because the energy is no longer smeared over a soft edge.
+  Preservative folds the same specular emphasis into the gather weights and
+  renormalises, so the disc keeps its colour and falloff. Existing projects are
+  untouched; this changes only what a freshly applied effect starts with.
+- **4×4 tent pyramid downsample** (was a 2×2 box). The gather reads nearly all
+  of its defocused colour out of this pyramid, so the pyramid is the inside of
+  every bokeh disc; a box filter leaks enough aliasing per level to read as
+  blocky texels on a still and as crawling texture in motion. Deliberately not a
+  Karis average — that fixes fireflies by discarding the highlight energy that
+  makes bokeh worth having.
+- **Pyramid edges clamp instead of mirror.** Mirroring answered off-frame taps
+  with a flipped copy of the plate, so a bright point near the border was
+  gathered twice and printed a phantom bokeh across the frame edge.
+- **Sample Quality ceiling raised to 2048** (was 1024), with 1536/2048 rungs
+  added to the Vogel ladder. Extreme mode's footprint-derived tap cap was
+  clipping against the old ceiling on large bokeh.
+
+CPU and CUDA paths agree to a mean of 0.002/255 (max 3/255) on the reference
+frame.
+
+### Seven new lens presets
+
+Chosen to reach optical territory the existing nineteen did not, rather than to
+lengthen the menu — each one was checked against the current lineup first.
+
+- **Sony 135mm STF (Apodized)** — the apodization lens. A radially graded ND
+  element inside the barrel fades the disc to nothing at its rim, so there is no
+  bokeh *edge* at all. The softest previous entry (Mir-1V) spends its softness
+  alongside heavy swirl and fringing; here it is the entire point.
+- **Cooke S4/i (Cine Warm)** — "the Cooke Look": rounded 8-blade cine prime left
+  deliberately undercorrected so highlights bloom into their discs instead of
+  ringing. The counterpoint to the Sigma Art, which is the same cleanliness
+  taken the other way.
+- **CCTV 25mm f/1.4 (C-mount)** — the cheap security lens on mirrorless. Hard
+  hexagonal iris, violent swirl and vignetting, uncorrected fringing. The
+  Cyclop's swirl comes from a bladeless *circular* aperture and stays soft; this
+  one is all hard edges.
+- **Rodenstock Imagon (Soft Focus)** — the classic portrait soft-focus head.
+  Undercorrected spherical aberration taken to the end of its range, where the
+  disc stops reading as a disc and becomes a halo.
+- **Reflex 1000mm (Donut)** — the *bad* mirror lens, against the clean MTO-500.
+  Same central obstruction, plus the coarse machining texture and real
+  astigmatism that give mirror bokeh its reputation.
+- **Angenieux 25-250 (Vintage Zoom)** — every ground surface in a zoom prints
+  another ring, so the onion structure runs far heavier than the Helios's
+  machining marks, over a moderate swirl and cool vintage coating cast.
+- **Tilt-Shift Miniature** — the one use of Field Curvature the existing rigs do
+  not cover: they all pair it with heavy astigmatism to get streaks. Pure
+  depth-independent edge blur with a tight sweet spot reads as "miniature"
+  rather than "broken lens".
+
+As with every preset since v2.9.4 these are optics-only — they write the iris
+and aberration sliders and leave your highlight grade alone.
+
+### Stability and correctness
+
+A pass over the concurrency edges around the CUDA path and the AE contract.
+None of these change a rendered pixel; all of them were reachable in ordinary
+use, mostly on machines with many cores.
+
+- **A busy moment no longer costs the session its GPU.** The device path
+  latches OFF for the rest of the session when a CUDA call fails, which is
+  right for a broken device and wrong for a transient one — and two transient
+  conditions were being reported the same way: "all four pooled result sets are
+  in flight" (routine Multi-Frame Rendering contention: a set is held for the
+  whole composite, so five concurrent frames exhaust the pool) and "not enough
+  free VRAM this instant" (a number owned mostly by other effects). Either one
+  silently dropped every later frame to the CPU gather — roughly 10x slower,
+  with only the panel badge to say so. They now report `ZLUX_GPU_BUSY`: this
+  frame goes to the CPU, the next one retries the GPU.
+- **The result-set pool no longer frees buffers out from under a live reader.**
+  Raising the frame size reallocated *every* pinned set under the device mutex —
+  but a set handed to an earlier frame is being read by that frame's compositor
+  right then, outside the mutex. Adjustment layers switch resolution constantly,
+  which is exactly how that got hit. Each set now carries its own capacity and
+  grows only in the thread that just claimed it.
+- **`in_use` is atomic.** It was claimed under the device mutex and released
+  without it. The realistic failure was a release the claim loop never observed,
+  which looked like permanent pool exhaustion.
+- **Tearing down the GPU context is no longer permanent.** `Shutdown()` nulled
+  a slot whose initialiser was a function-local static, so the context could
+  never be recreated: every render after a GlobalSetdown/GlobalSetup pair (AE
+  does reload effects mid-session) fell to the CPU. The context is now created
+  lazily under the device mutex, and teardown clears the failure latch.
+- **A failed aperture-texture upload is no longer ignored.** The return value
+  was discarded, so a failure left the *previous* frame's iris texture bound and
+  the gather rendered the wrong aperture — breaking the one guarantee the GPU
+  path exists to keep, that having a GPU never changes output.
+- **The aperture-map library cache is no longer a shared mutable global.** One
+  cache slot, refilled in place at the top of `RenderCore`, meant a second
+  effect instance on a different map would `clear()` the vector while another
+  render thread was reading it in the gather — a use-after-free, and a reload on
+  every frame for as long as both instances rendered. Loads now produce
+  immutable maps handed out as `shared_ptr`, so each frame holds its own for its
+  duration and two instances stop fighting over one slot.
+- **`PF_OutFlag_PIX_INDEPENDENT` removed.** It asserts that an output pixel does
+  not depend on its neighbours, which lets AE leave unneeded rows filled with
+  garbage during field rendering — and a defocus gather reads exactly those
+  rows. It only ever bought a field-rendering optimisation this effect cannot
+  use.
+- **Bit depth is read from AE rather than inferred.** `rowbytes >= width *
+  sizeof(PF_PixelFloat)` cannot separate 8 bpc from 32 bpc on very narrow
+  worlds, because row padding pushes a 4-px-wide 8 bpc row to exactly the float
+  stride — thumbnail-sized renders were read as float out of a quarter-sized
+  buffer. Smart render now uses `PF_SmartRenderInput::bitdepth`, which also
+  makes every checked-out layer's depth exact.
+- **Vogel LUT device buffers grow with the ladder** instead of being sized by
+  the first frame. The ladder is fixed today, which is precisely why the
+  first-frame sizing looked safe; the memcpys always used the current frame's
+  count.
+
 ## v3.0.0 — CUDA gather
 
 **9.0× faster per frame.** The depth-of-field gather now runs on the GPU.

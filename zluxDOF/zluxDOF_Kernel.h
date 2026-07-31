@@ -26,6 +26,18 @@ extern "C" {
 // buffers). One per render; cheap to keep alive across frames of a sequence.
 typedef struct ZluxGpuContext ZluxGpuContext;
 
+// ── Return codes ───────────────────────────────────────────────────────────
+// Every entry point returns one of these. The distinction between FAIL and BUSY
+// is load-bearing: the caller latches the GPU path OFF for the session on FAIL
+// (a device that failed once keeps failing, and retrying turns one bad frame
+// into a stalled render), but must NOT latch on BUSY -- that is a transient
+// resource conflict between concurrently rendering frames, and the very next
+// frame will usually succeed. Conflating the two meant one moment of MFR
+// contention dropped the whole session to the CPU gather.
+#define ZLUX_GPU_OK   0
+#define ZLUX_GPU_FAIL 1
+#define ZLUX_GPU_BUSY 2
+
 // ── Vogel sample records, float mirror of the CPU VogelSample ──────────────
 // Split hot/cold purely for upload compactness and because the hot record is
 // exactly a float4, which is a single 16-byte vectorised load on the device.
@@ -49,7 +61,7 @@ typedef struct {
 	float _pad;           // keep the record 32 B / float4-aligned
 } ZluxVogelCold;
 
-// Descriptor for one Vogel LUT in the ladder (13 of them, 16..1024 samples).
+// Descriptor for one Vogel LUT in the ladder (15 of them, 16..2048 samples).
 typedef struct {
 	int   count;
 	int   offset;   // index of this LUT's first sample in the flat upload array
@@ -80,6 +92,10 @@ typedef struct {
 	float focal_distance;
 	float anamorphic_ratio;
 	float highlight_boost;
+	// 0..1. Scales away the colour-mip footprint floor, i.e. how much the gather
+	// is allowed to pre-average the source before integrating the disc. 0 = the
+	// v3.0 floor (35% of the blur radius), 1 = no floor, Vogel spacing only.
+	float bokeh_definition;
 	float bokeh_gamma;          // >0 enables the LUT weighting
 	float highlight_scatter;
 	int   highlight_mode;   // 0 = additive sprite, 1 = preservative (renormalised)
@@ -126,7 +142,14 @@ typedef struct {
 	float* near_rgba;  // float4: rgb + alpha
 	float* bleed_rgba; // float4: rgb + coverage (far bleed-over)
 	float* mattes;     // float4: far matte, near matte, bleed matte, unused
+	// Identifies the pooled page-locked set these pointers belong to. The caller
+	// MUST hand it back with zluxGpuReleaseResults once the compositor is done,
+	// or the pool runs dry and later frames fall back to the CPU.
+	int    slot;
 } ZluxGatherOutputs;
+
+// Returns a result set to the pool. Safe with slot < 0 (nothing was claimed).
+void zluxGpuReleaseResults(ZluxGpuContext* ctx, int slot);
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -188,13 +211,28 @@ int zluxGpuBuildDiscDist(ZluxGpuContext* ctx, const ZluxGatherParams* params);
 // texture, replacing the CPU precompute AND three full-frame uploads.
 // Call after zluxGpuUploadFields; then far/near/bleed_radius in ZluxGatherFields
 // may be NULL.
+// Runs the depth-field filter chain on the device: occlusion-boundary snap,
+// isolated-speck suppression and thin-clutter declutter, in that order. They
+// operate back to back on the same signed-CoC field, so they share ONE upload
+// and ONE download instead of three round trips.
+// `protect` is the Foreground Protect mask, one float per pixel. Each stage can
+// be skipped independently, which is what lets them be A/B'd against the CPU
+// implementations one at a time.
+int zluxGpuDepthFilters(ZluxGpuContext* ctx,
+                        const float* signed_coc, const float* protect,
+                        int w, int h, int do_snap, int do_despeckle,
+                        int do_declutter, float* out_coc);
+
 int zluxGpuBuildRadii(ZluxGpuContext* ctx, const ZluxGatherParams* params,
                       const float* tile_min_coc, int tiles_x, int tiles_y,
                       int tile_size, float px_per_coc, float uniform_base,
                       float field_curvature, float field_sweet);
 
 // Runs the far + near gathers and copies the results back into `out`.
-// Returns 0 on success. `elapsed_ms` receives pure kernel time when non-null.
+// Returns ZLUX_GPU_OK on success, ZLUX_GPU_BUSY when every result set is still
+// held by an in-flight frame (render this one on the CPU and try again next
+// frame -- the GPU is healthy), or ZLUX_GPU_FAIL on a real device error.
+// `elapsed_ms` receives pure kernel time when non-null.
 int zluxGpuGather(ZluxGpuContext* ctx, const ZluxGatherParams* params,
                   ZluxGatherOutputs* out, float* elapsed_ms);
 

@@ -6,7 +6,7 @@
 
 *Vogel-spiral bokeh engine · vintage glass soul · single-file install*
 
-![Version](https://img.shields.io/badge/version-2.15.1-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey) ![Host](https://img.shields.io/badge/After%20Effects-2022%2B-9999ff) ![License](https://img.shields.io/badge/license-Freeware-green)
+![Version](https://img.shields.io/badge/version-3.1.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey) ![Host](https://img.shields.io/badge/After%20Effects-2022%2B-9999ff) ![License](https://img.shields.io/badge/license-Freeware-green)
 
 <!-- PLACEHOLDER: hero shot — best-looking frame, heavy bokeh, point lights -->
 ![zluxDOF hero](docs/img/hero.png)
@@ -31,7 +31,7 @@ Feed it any depth map — AI-generated (Depth Anything / MiDaS), a 3D render Z-p
 ## Highlights
 
 ### 🔭 Real lens presets
-19 one-click lenses, each modeled on the documented optical character of the actual glass — and every preset **bakes into the sliders**, so it's a starting point you can edit, not a black box:
+26 one-click lenses, each modeled on the documented optical character of the actual glass — and every preset **bakes into the sliders**, so it's a starting point you can edit, not a black box:
 
 | Preset | Character |
 |---|---|
@@ -50,11 +50,23 @@ Feed it any depth map — AI-generated (Depth Anything / MiDaS), a 3D render Z-p
 | **Swirl-o-Tron 58 (Vortex)** | astigmatism cranked into a hypnotic full-frame vortex |
 | **Starburst Zoom 35** | radial zoom-burst streaks + glowing field-curvature edges |
 | **Anamorphic Comet 2x** | 2× squeeze sheared into leaning comet-streak bokeh |
+| **Sony 135mm STF (Apodized)** | graded-ND element — discs with no edge at all, the smoothest bokeh ever built |
+| **Cooke S4/i (Cine Warm)** | the Cooke Look: warm, undercorrected, highlights bloom instead of ringing |
+| **CCTV 25mm f/1.4 (C-mount)** | hard hexagonal iris, violent swirl and fringing — the cheap-lens look |
+| **Rodenstock Imagon** | soft-focus head: the disc dissolves into a halo |
+| **Reflex 1000mm (Donut)** | the *bad* mirror lens — swirling, ringed donuts |
+| **Angenieux 25-250 (Vintage Zoom)** | heavy onion rings from a zoom's element count, cool coating cast |
+| **Tilt-Shift Miniature** | pure field-curvature edge blur, tight sweet spot — the toy-town rig |
 
 <!-- PLACEHOLDER: 3-4 preset comparison grid on the same shot -->
 ![Lens presets](docs/img/presets_grid.png)
 
 ### 🕳 Iris construction
+- **Bokeh Definition** — how hard a bokeh disc's edge is allowed to be. The
+  gather pre-averages the source before it integrates the disc, and that
+  pre-average *is* the edge gradient; this slider dials it away. 0% is the
+  creamy v3.0 render, 100% is hard-edged "bokeh balls". Raise **Sample Quality**
+  (now up to 2048) with it.
 - Circular / polygonal (3–16 blades, curvature from star to circle) / notched irises
 - **80 real aperture maps** in a clickable thumbnail picker (scratched, dusty, shaped pupils)
 - **Procedural onion rings** — aspheric machining grooves inside every disc

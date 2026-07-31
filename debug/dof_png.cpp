@@ -93,6 +93,8 @@ int main(int argc, char** argv) {
     s.depth_invert = FALSE;      // white = near (standard)
     s.near_blur_factor = 1.0;    // ENABLE near blur so we can see foreground defocus
     s.sample_count = getenv("ZLUX_SAMPLES") ? atol(getenv("ZLUX_SAMPLES")) : 256;
+    // v3.1 Bokeh Definition (0..1). 0 reproduces the v3.0 footprint floor.
+    s.bokeh_definition = getenv("ZLUX_BDEF") ? atof(getenv("ZLUX_BDEF")) : 0.65;
     s.render_mode = getenv("ZLUX_RMODE") ? atol(getenv("ZLUX_RMODE")) : 2; // 1 Fast 2 Final 3 Extreme
     s.energy_conserving = getenv("ZLUX_ENERGY") ? (atol(getenv("ZLUX_ENERGY")) != 0) : FALSE;
     // (srgb_linear / bg_inpaint were retired from DOFSettings; the harness used to
@@ -105,8 +107,30 @@ int main(int argc, char** argv) {
     s.astigmatism = getenv("ZLUX_ASTIG") ? atof(getenv("ZLUX_ASTIG")) : 0.0;
     s.astigmatism_type_sagittal = getenv("ZLUX_SAGITTAL") ? TRUE : FALSE;
     s.anamorphic_ratio = getenv("ZLUX_ANAM") ? atof(getenv("ZLUX_ANAM")) : 1.0;
-    s.aperture_blades = 6;
+    // The rest of the Lens Character group, so a Lens Preset row can be replayed
+    // here in full. Without these the preset table was only checkable by reading
+    // it: every entry drives softness / spherical aberration / vignetting /
+    // catadioptric / onion / field curvature, and none of them were reachable.
+    // All are in DECODED units (0..1, or the signed -1..1 the sliders map to),
+    // not the 0..100 panel units the LensPreset table stores.
+    s.softness         = getenv("ZLUX_SOFT")   ? atof(getenv("ZLUX_SOFT"))   : 0.0;
+    s.spherical_aberration_amount = getenv("ZLUX_SA")    ? atof(getenv("ZLUX_SA"))    : 0.0;
+    s.spherical_aberration_scale  = getenv("ZLUX_SASC")  ? atof(getenv("ZLUX_SASC"))  : 0.0;
+    s.vignetting       = getenv("ZLUX_VIG")    ? atof(getenv("ZLUX_VIG"))    : 0.0;
+    s.vignetting_scale = getenv("ZLUX_VIGSC")  ? atof(getenv("ZLUX_VIGSC"))  : 1.0;
+    s.catadioptric     = getenv("ZLUX_CATA")   ? atof(getenv("ZLUX_CATA"))   : 0.0;
+    s.onion_amount     = getenv("ZLUX_ONION")  ? atof(getenv("ZLUX_ONION"))  : 0.0;
+    s.onion_count      = getenv("ZLUX_ONIONN") ? atof(getenv("ZLUX_ONIONN")) : 12.0;
+    s.field_curvature  = getenv("ZLUX_FCURV")  ? atof(getenv("ZLUX_FCURV"))  : 0.0;
+    s.field_sweet      = getenv("ZLUX_FSWEET") ? atof(getenv("ZLUX_FSWEET")) : 0.45;
+    s.blade_curve      = getenv("ZLUX_CURVE")  ? atof(getenv("ZLUX_CURVE"))  : 0.0;
+    s.aperture_blades = getenv("ZLUX_BLADES") ? atol(getenv("ZLUX_BLADES")) : 6;
     s.aperture_shape_mode = getenv("ZLUX_SHAPE") ? atol(getenv("ZLUX_SHAPE")) : 1;
+    // ZLUX_APMAP=1..80 selects a built-in aperture-map library shape, so the
+    // library path can be A/B'd (CPU vs GPU) like every other mode. The map is
+    // read from aperture_lib/ next to this exe -- the harness has none of the
+    // .aex's embedded resources.
+    s.aperture_map_index = getenv("ZLUX_APMAP") ? atol(getenv("ZLUX_APMAP")) : 0;
     s.aperture_texture_intensity = getenv("ZLUX_APINT") ? atof(getenv("ZLUX_APINT")) : 1.0;
     s.aperture_texture_scale = getenv("ZLUX_APSCALE") ? atof(getenv("ZLUX_APSCALE")) : 1.0;
     s.aperture_texture_offset = getenv("ZLUX_APOFF") ? atof(getenv("ZLUX_APOFF")) : 0.0;
@@ -116,7 +140,7 @@ int main(int argc, char** argv) {
     s.bokeh_gamma     = getenv("ZLUX_GAMMA")   ? atof(getenv("ZLUX_GAMMA"))   : 0.8;
     s.highlight_recovery = getenv("ZLUX_REC")  ? atof(getenv("ZLUX_REC"))     : 0.0;
     s.highlight_scatter  = getenv("ZLUX_SCAT") ? atof(getenv("ZLUX_SCAT"))    : 0.0;
-    s.highlight_mode     = getenv("ZLUX_HLMODE")? atol(getenv("ZLUX_HLMODE"))  : 0;
+    s.highlight_mode     = getenv("ZLUX_HLMODE")? atol(getenv("ZLUX_HLMODE"))  : 1;  // v3.1: Preservative
     s.highlight_boost    = getenv("ZLUX_BOOST")? atof(getenv("ZLUX_BOOST"))   : 0.0;
     s.highlights_low = 200.0; s.highlights_high = 255.0; s.highlights_softness = 0.01;
 
