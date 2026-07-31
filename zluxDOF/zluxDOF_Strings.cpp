@@ -1,0 +1,132 @@
+#include "zluxDOF.h"
+
+typedef struct {
+	A_u_long index;
+	// Sized for the longest choice string, which is always the Lens Preset list
+	// (585 chars at v3.1's 26 presets). Raised 512 -> 1024 when that list
+	// outgrew the old bound -- note the failure was a COMPILE error, not a
+	// silent truncation, so this bound is self-policing: add presets until the
+	// build complains, then raise it again.
+	A_char str[1024];
+} TableString;
+
+TableString g_strs[StrID_NUMTYPES] = {
+	{StrID_NONE, ""},
+	{StrID_Name, "zluxDOF"},
+	{StrID_Description, "Depth of Field plugin by zlux (Zluxia). Pro-grade cinematic bokeh with lens presets, custom iris, chromatic aberration, highlight shaping and grain."},
+	{StrID_Banner_Param_Name, "zluxDOF"},
+	{StrID_Preset, "Lens Preset"},
+	{StrID_Preset_Choices, "Manual|Helios 44-2 58mm f/2|Cyclop 85mm f/1.5|Mir-1V 37mm f/2.8|Industar-61 L/Z Star|MTO-500 Mirror|Trioplan 100mm f/2.8|Petzval 85 (Lomography)|Canon 50mm f/0.95 Dream|Lensbaby Velvet 56|Sigma 105mm f/1.4 Art|LOMO 35-NAP Anamorphic 2x|Laowa Nanomorph 1.5x|Bokeh: Grungy Vintage|Lensbaby Sweet 50|Lensbaby Burnside 35|Wide Macro Rig (Psyche)|Swirl-o-Tron 58 (Vortex)|Starburst Zoom 35|Anamorphic Comet 2x|Sony 135mm STF (Apodized)|Cooke S4/i (Cine Warm)|CCTV 25mm f/1.4 (C-mount)|Rodenstock Imagon (Soft Focus)|Reflex 1000mm (Donut)|Angenieux 25-250 (Vintage Zoom)|Tilt-Shift Miniature"},
+	{StrID_Display_Group, "Display"},
+	{StrID_Display_Mode, "Preview Mode"},
+	{StrID_Display_Mode_Choices, "Rendered|Depth Map|Depth Stabilized|CoC Heat Map|Focus Peaking|Selected Highlights|Iris|Iris Array"},
+	{StrID_Gamma_Correction, "Linear Gamma (sRGB)"},
+	{StrID_Depth_Group, "Depth & Focus"},
+	{StrID_Depth_Layer, "Depth Map Layer"},
+	{StrID_Depth_Channel, "Depth Channel"},
+	{StrID_Depth_Channel_Choices, "Luminance|Red|Green|Blue"},
+	{StrID_Depth_Invert, "Invert Depth"},
+	{StrID_Depth_Focus, "Focus Distance"},
+	{StrID_Depth_SetFocus, "Pick Focus Point"},
+	{StrID_Depth_Curve, "Focus Transition"},
+	{StrID_Depth_NearBlur, "Near-Field Blur Strength"},
+	{StrID_Depth_Blackpoint, "Depth Black Point"},
+	{StrID_Depth_Whitepoint, "Depth White Point"},
+	{StrID_Depth_ForegroundProtect, "Edge Protect"},
+	{StrID_Aperture_Group, "Aperture & Iris"},
+	{StrID_Aperture_Shape, "Iris Shape"},
+	{StrID_Aperture_Shape_Choices, "Circular|Polygonal|Notched|Custom (Layer)"},
+	{StrID_Custom_Aperture, "Custom Iris Layer"},
+	{StrID_Aspect_Ratio, "Aspect Ratio (Anamorphic)"},
+	{StrID_Aperture_Size, "Blur Amount"},
+	{StrID_Sample_Count, "Sample Quality"},
+	{StrID_Bokeh_Definition, "Bokeh Definition"},
+	{StrID_Barrel_Distortion, "Barrel Distortion"},
+	{StrID_Softness, "Bokeh Softness"},
+	{StrID_Aperture_Blades, "Iris Blades"},
+	{StrID_Blade_Angle, "Blade Rotation"},
+	{StrID_Blade_Curve, "Blade Curvature"},
+	{StrID_Notch_Angle, "Notch Angle"},
+	{StrID_Notch_Scale, "Notch Depth"},
+	{StrID_LensCharacter_Group, "Lens Character"},
+	{StrID_Spherical_Aberration, "Spherical Aberration"},
+	{StrID_Spherical_Aberration_Plus, "Astigmatism: Sagittal"},
+	{StrID_Spherical_Aberration_Scale, "SA: Edge Sharpness"},
+	{StrID_Spherical_Aberration_Offset, "SA: Rotation"},
+	{StrID_Optical_Vignetting, "Optical Vignetting (Cat's-Eye)"},
+	{StrID_Optical_Vignetting_Scale, "Vignetting Falloff"},
+	{StrID_Astigmatism, "Astigmatism"},
+	{StrID_Catadioptric, "Mirror (Catadioptric)"},
+	{StrID_Catadioptric_Scale, "Mirror Ring Size"},
+	{StrID_CA_Group, "Chromatic Aberration"},
+	{StrID_Highlights_Group, "Highlights / Bokeh Shaping"},
+	{StrID_Highlights_Lower, "Lower Threshold"},
+	{StrID_Highlights_Upper, "Upper Threshold"},
+	{StrID_Highlights_Softness, "Threshold Softness"},
+	{StrID_Highlights_Saturation, "Saturation Shift"},
+	{StrID_Highlights_Enhancement, "Bokeh Brightness Boost"},
+	{StrID_Highlights_BokehGamma, "Bokeh Gamma (Highlight Punch)"},
+	{StrID_Highlights_Scatter, "Highlight Scatter (Specular Sprite)"},
+	{StrID_Highlights_Mode, "Highlight Mode"},
+	{StrID_Highlights_Mode_Choices, "Additive|Preservative"},
+	{StrID_Highlights_Recovery, "Highlight Clipping Recovery"},
+	{StrID_Highlights_Tint, "Highlight Tint"},
+	{StrID_ApTex_Group, "Iris Texture"},
+	{StrID_ApTex_Layer, "Iris Texture Layer"},
+	{StrID_ApTex_Invert, "Invert"},
+	{StrID_ApTex_Intensity, "Intensity"},
+	{StrID_ApTex_Scale, "Scale"},
+	{StrID_ApTex_Offset, "Offset"},
+	{StrID_MatteBox_Group, "Matte Box"},
+	{StrID_MatteBox_Top, "Top"},
+	{StrID_MatteBox_Bottom, "Bottom"},
+	{StrID_MatteBox_Left, "Left"},
+	{StrID_MatteBox_Right, "Right"},
+	{StrID_Noise_Group, "Grain / Noise"},
+	{StrID_Noise_Amount, "Grain Amount"},
+	{StrID_Noise_Animated, "Animated"},
+	{StrID_Noise_Monochromatic, "Monochromatic"},
+	{StrID_Noise_LumaDistribution, "Luma Distribution"},
+	{StrID_Noise_LumaDistribution_Choices, "Uniform|Photometric"},
+	{StrID_Noise_MapDistribution, "Grain Map"},
+	{StrID_Noise_MapDistribution_Choices, "Fixed|Focus Map|Blur Amount"},
+	{StrID_Noise_Tint, "Grain Tint"},
+	{StrID_About_Title, "About zluxDOF"},
+	// (Version-less on purpose: the live About dialog is built by
+	// FormatAboutMessage from the version macros; this string is unused
+	// legacy kept only for table alignment.)
+	{StrID_About_Body,
+		"zluxDOF - by zlux (zluxia).\r"
+		"Cinematic Depth of Field with lens presets, custom iris, "
+		"aberrations, bokeh gamma, bloom and grain."},
+	{StrID_Depth_Gamma, "Depth Gamma"},
+	{StrID_Depth_Smoothing, "Depth Smoothing"},
+	{StrID_Aspect_Preset, "Aspect Preset"},
+	{StrID_Aspect_Preset_Choices,
+		"Custom|Spherical 1.0|Anamorphic 2x|Anamorphic 1.5x|Anamorphic 1.33x|Cinemascope 2.39|Widescreen 1.85|IMAX 1.43|NTSC 0.91|PAL 1.09"},
+	{StrID_Aperture_Map, "Aperture Map (Library)"},
+	{StrID_Aperture_Map_Choices, ""},   // built dynamically in ParamsSetup
+	{StrID_ApMap_Picker, "Aperture Map Picker (re-click = Off)"},
+	{StrID_Bokeh_Preview, "Bokeh Preview"},
+	{StrID_Highlights_Bloom, "Bloom (Halation)"},
+	{StrID_Highlights_BloomRadius, "Bloom Radius"},
+	{StrID_Highlights_BloomThreshold, "Bloom Threshold"},
+	{StrID_Render_Mode, "Render Mode"},
+	{StrID_Render_Mode_Choices, "Fast (Preview)|Final|Extreme (Hero Shot)"},
+	{StrID_Onion_Rings, "Onion Rings (Aspheric)"},
+	{StrID_Onion_Ring_Count, "Onion Ring Count"},
+	{StrID_Field_Curvature, "Field Curvature (Edge Blur)"},
+	{StrID_Field_Sweet, "Sweet Spot Size"},
+	{StrID_CA_RedCyan, "Red / Cyan %"},
+	{StrID_CA_GreenMagenta, "Green / Magenta %"},
+	{StrID_CA_BlueYellow, "Blue / Yellow %"},
+	{StrID_Energy_Conserving, "Energy-Conserving Bokeh (Physical)"},
+	{StrID_Srgb_Linear, "sRGB Linearize (8/16-bit Accurate)"},
+	{StrID_Bg_Inpaint, "Background Inpaint (Foreground Reveal)"},
+	{StrID_Depth_Levels, "Depth Levels"}
+};
+
+char* GetStringPtr(int strNum)
+{
+	return g_strs[strNum].str;
+}

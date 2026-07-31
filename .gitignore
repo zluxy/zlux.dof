@@ -1,2 +1,62 @@
 # The plugin binary is distributed via GitHub Releases, not the repo.
 *.aex
+# ── Third-party material that must NOT be published ─────────────────────────
+# Adobe's SDK headers carry an "ADOBE CONFIDENTIAL" notice stating that
+# reproduction is forbidden without written permission. Anyone building this
+# needs their own copy from https://developer.adobe.com/after-effects/
+AfterEffectsSDK/
+
+# Reverse-engineered material from a commercial third-party plugin. Kept local
+# for reference only; publishing it would be a straightforward copyright issue.
+dofpro_ae_src/
+
+# Third-party ReShade shader, no license granted in the file.
+MartysMods_DEPTHOFFIELD.fx
+
+# ── Build output ────────────────────────────────────────────────────────────
+build_out/
+zluxDOF/Win/x64/
+zluxDOF/build/
+*.aex
+*.obj
+*.sbr
+*.bsc
+*.pdb
+*.iobj
+*.ipdb
+*.exp
+*.lib
+*.map
+*.res
+*.tlog/
+*.recipe
+*.log
+*.CppClean.log
+*.FileListAbsolute.txt
+
+# ── Local snapshots ─────────────────────────────────────────────────────────
+_backups/
+
+# ── Debug harness: keep the sources, drop the binaries and image dumps ──────
+debug/*.exe
+debug/*.raw
+debug/*.png
+debug/*.lib
+debug/*.exp
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.vs/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+
+# ── Debug-session leftovers ─────────────────────────────────────────────────
+# Crash breadcrumbs written by ZLUX_TRACE, and the CUDA runtime copied next to
+# the harness so it can resolve cudart without the toolkit being on PATH.
+debug/*.txt
+debug/*.dll
+debug/__pycache__/
+# Junction to ../aperture_lib, so the harness can resolve ZLUX_APMAP shapes
+# (it has none of the .aex's embedded resources).
+debug/aperture_lib
