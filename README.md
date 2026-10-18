@@ -29,115 +29,78 @@ I built Reverie around the part I kept coming back to: a blur should look like i
 
 You can get started with just the radius. When you want to go further, there are 44 editable lens looks, 80 aperture maps, custom iris layers, blades, curvature, rotation, texture, cat's-eye clipping and highlight controls. The detailed controls stay out of the way until you need them.
 
-## One real test frame
+## More frames from the footage
 
-This CS:GO frame was used to check the Highlights fix. Both images come from the same source; the second frame was rendered by Reverie with its depth map. Click either image to inspect it at full size.
+Original first, Reverie second. Each depth map is available below its pair. Renders use Reverie's native GPU test host.
 
-### Original frame
+### Cyclop 85mm f/1.5
 
 <p align="center"><a href="assets/csgo-original.png"><img src="assets/csgo-original.png" width="960" alt="Original CS:GO frame"></a></p>
-
-### Reverie 3.3.0
 
 <p align="center"><a href="assets/csgo-reverie.png"><img src="assets/csgo-reverie.png" width="960" alt="CS:GO frame rendered through Reverie"></a></p>
 
 <details>
-<summary>Show the depth layer used for this frame</summary>
+<summary>Depth map</summary>
 
 <p align="center"><img src="assets/csgo-depth.png" width="800" alt="Depth layer used for the CS:GO render"></p>
 
 </details>
 
-The test uses **Cyclop 85mm f/1.5**, a **35 px** blur radius and a focus point on the subject. Highlight Boost is deliberately set to **200** with a lower threshold of **0**: this is an aggressive regression test for the repaired controls, not a recommended grade for every shot. The image was produced through the native render test host, not captured from the After Effects interface.
+### Helios 44-2 58mm f/2
 
-<!-- FUTURE IMAGE SLOT: assets/real-world-depth.png — source, actual depth layer and final render from one real-life shot. -->
-<!-- FUTURE IMAGE SLOT: assets/lens-comparison.png — same source/focus/radius with several lens looks. -->
+<p align="center"><a href="assets/forest-jump-source.jpg"><img src="assets/forest-jump-source.jpg" width="960" alt="Forest action frame before depth of field"></a></p>
 
-## More frames from the footage
+<p align="center"><a href="assets/forest-jump-reverie.jpg"><img src="assets/forest-jump-reverie.jpg" width="960" alt="Forest action frame rendered with Reverie Helios lens preset"></a></p>
 
-These are synchronized beauty and depth passes from the CS:GO footage archive. I combined the world and player passes, then rendered the matching depth map through Reverie's native GPU test host. The source and result in each pair are the same frame; no generated imagery is used.
-
-Six frames, six different lens looks: **Helios**, **Sony STF**, **Canon Dream**, **LOMO Anamorphic**, **Petzval** and **Cooke S4**. Each shot uses the preset that worked best for its composition, rather than one look across the whole gallery.
-
-### A clear subject against the forest
-
-**Take 0030, frame 1303 · Helios 44-2 58mm f/2 · 28 px radius.** Focus stays on the airborne player while the trees recede into the lens blur.
-
-<p align="center"><a href="assets/forest-jump-source.jpg"><img src="assets/forest-jump-source.jpg" width="960" alt="Forest action frame before depth of field"></a><br><sub>Original frame</sub></p>
-
-<p align="center"><a href="assets/forest-jump-reverie.jpg"><img src="assets/forest-jump-reverie.jpg" width="960" alt="Forest action frame rendered with Reverie Helios lens preset"></a><br><sub>Reverie</sub></p>
-
-<details><summary>Show this frame's depth map</summary>
+<details><summary>Depth map</summary>
 
 <p align="center"><a href="assets/forest-jump-depth.png"><img src="assets/forest-jump-depth.png" width="960" alt="Depth map for the forest action frame"></a></p>
 
 </details>
 
-### A close portrait in the courtyard
+### Canon 50mm f/0.95 Dream
 
-**Take 0032, frame 274 · Canon 50mm f/0.95 Dream · 55 px radius.** The gas mask and weapon stay in focus while the stonework behind them softens.
+<p align="center"><a href="assets/castle-portrait-source.jpg"><img src="assets/castle-portrait-source.jpg" width="960" alt="Courtyard close-up before depth of field"></a></p>
 
-<p align="center"><a href="assets/castle-portrait-source.jpg"><img src="assets/castle-portrait-source.jpg" width="960" alt="Courtyard close-up before depth of field"></a><br><sub>Original frame</sub></p>
+<p align="center"><a href="assets/castle-portrait-reverie.jpg"><img src="assets/castle-portrait-reverie.jpg" width="960" alt="Courtyard close-up rendered with Reverie Canon Dream lens preset"></a></p>
 
-<p align="center"><a href="assets/castle-portrait-reverie.jpg"><img src="assets/castle-portrait-reverie.jpg" width="960" alt="Courtyard close-up rendered with Reverie Canon Dream lens preset"></a><br><sub>Reverie</sub></p>
-
-<details><summary>Show this frame's depth map</summary>
+<details><summary>Depth map</summary>
 
 <p align="center"><a href="assets/castle-portrait-depth.png"><img src="assets/castle-portrait-depth.png" width="960" alt="Depth map for the courtyard close-up"></a></p>
 
 </details>
 
-### Metal and glass up close
+### LOMO 35-NAP Anamorphic 2x
 
-**Take 0033, frame 631 · LOMO 35-NAP Anamorphic 2x · 55 px radius.** The foreground weapon remains crisp against the softer second player and wall.
+<p align="center"><a href="assets/weapon-detail-source.jpg"><img src="assets/weapon-detail-source.jpg" width="960" alt="Weapon detail before depth of field"></a></p>
 
-<p align="center"><a href="assets/weapon-detail-source.jpg"><img src="assets/weapon-detail-source.jpg" width="960" alt="Weapon detail before depth of field"></a><br><sub>Original frame</sub></p>
+<p align="center"><a href="assets/weapon-detail-reverie.jpg"><img src="assets/weapon-detail-reverie.jpg" width="960" alt="Weapon detail rendered with Reverie LOMO Anamorphic lens preset"></a></p>
 
-<p align="center"><a href="assets/weapon-detail-reverie.jpg"><img src="assets/weapon-detail-reverie.jpg" width="960" alt="Weapon detail rendered with Reverie LOMO Anamorphic lens preset"></a><br><sub>Reverie</sub></p>
-
-<details><summary>Show this frame's depth map</summary>
+<details><summary>Depth map</summary>
 
 <p align="center"><a href="assets/weapon-detail-depth.png"><img src="assets/weapon-detail-depth.png" width="960" alt="Depth map for the weapon detail"></a></p>
 
 </details>
 
-### Two players at the barrels
+### Cooke S4/i
 
-**Take 0034, frame 517 · Petzval 85 (Lomography) · 28 px radius.** Focus stays on the nearer player while the teammate and timber backdrop recede.
+<p align="center"><a href="assets/forest-team-source.jpg"><img src="assets/forest-team-source.jpg" width="960" alt="Forest team frame before depth of field"></a></p>
 
-<p align="center"><a href="assets/warehouse-team-source.jpg"><img src="assets/warehouse-team-source.jpg" width="960" alt="Two players at barrels before depth of field"></a><br><sub>Original frame</sub></p>
+<p align="center"><a href="assets/forest-team-reverie.jpg"><img src="assets/forest-team-reverie.jpg" width="960" alt="Forest team frame rendered with Reverie Cooke S4 lens preset"></a></p>
 
-<p align="center"><a href="assets/warehouse-team-reverie.jpg"><img src="assets/warehouse-team-reverie.jpg" width="960" alt="Two players at barrels rendered with Reverie Petzval lens preset"></a><br><sub>Reverie</sub></p>
-
-<details><summary>Show this frame's depth map</summary>
-
-<p align="center"><a href="assets/warehouse-team-depth.png"><img src="assets/warehouse-team-depth.png" width="960" alt="Depth map for the two players at barrels"></a></p>
-
-</details>
-
-### A team on the forest path
-
-**Take 0035, frame 1099 · Cooke S4/i (Cine Warm) · 22 px radius.** The leading player reads clearly against the trees and teammates behind him.
-
-<p align="center"><a href="assets/forest-team-source.jpg"><img src="assets/forest-team-source.jpg" width="960" alt="Forest team frame before depth of field"></a><br><sub>Original frame</sub></p>
-
-<p align="center"><a href="assets/forest-team-reverie.jpg"><img src="assets/forest-team-reverie.jpg" width="960" alt="Forest team frame rendered with Reverie Cooke S4 lens preset"></a><br><sub>Reverie</sub></p>
-
-<details><summary>Show this frame's depth map</summary>
+<details><summary>Depth map</summary>
 
 <p align="center"><a href="assets/forest-team-depth.png"><img src="assets/forest-team-depth.png" width="960" alt="Depth map for the forest team frame"></a></p>
 
 </details>
 
-### Focus across the stairwell
+### Sony 135mm STF
 
-**Take 0016, frame 1470 · Sony 135mm STF (Apodized) · 18 px radius.** The nearby player remains defined while the room beyond the railing falls out of focus.
+<p align="center"><a href="assets/stairs-source.jpg"><img src="assets/stairs-source.jpg" width="960" alt="Stairwell frame before depth of field"></a></p>
 
-<p align="center"><a href="assets/stairs-source.jpg"><img src="assets/stairs-source.jpg" width="960" alt="Stairwell frame before depth of field"></a><br><sub>Original frame</sub></p>
+<p align="center"><a href="assets/stairs-reverie.jpg"><img src="assets/stairs-reverie.jpg" width="960" alt="Stairwell frame rendered with Reverie Sony STF lens preset"></a></p>
 
-<p align="center"><a href="assets/stairs-reverie.jpg"><img src="assets/stairs-reverie.jpg" width="960" alt="Stairwell frame rendered with Reverie Sony STF lens preset"></a><br><sub>Reverie</sub></p>
-
-<details><summary>Show this frame's depth map</summary>
+<details><summary>Depth map</summary>
 
 <p align="center"><a href="assets/stairs-depth.png"><img src="assets/stairs-depth.png" width="960" alt="Depth map for the stairwell frame"></a></p>
 
