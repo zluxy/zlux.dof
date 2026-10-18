@@ -16,7 +16,7 @@
 <p align="center">
   <a href="https://github.com/zluxy/zlux.dof/releases/tag/v3.3.0"><strong>Download</strong></a> ·
   <a href="#start-with-the-image">Quick start</a> ·
-  <a href="#one-real-test-frame">Example</a> ·
+  <a href="#more-frames-from-the-footage">Examples</a> ·
   <a href="#the-numbers">Test results</a> ·
   <a href="#installation">Installation</a>
 </p>
@@ -53,6 +53,38 @@ The test uses **Cyclop 85mm f/1.5**, a **35 px** blur radius and a focus point o
 <!-- FUTURE IMAGE SLOT: assets/real-world-depth.png — source, actual depth layer and final render from one real-life shot. -->
 <!-- FUTURE IMAGE SLOT: assets/lens-comparison.png — same source/focus/radius with several lens looks. -->
 
+## More frames from the footage
+
+These are synchronized beauty and depth passes from the CS:GO footage archive. I combined the world and player passes, then rendered the matching depth map through Reverie's native GPU test host. The source and result in each pair are the same frame; no generated imagery is used.
+
+### A clear subject against the forest
+
+**Take 0030, frame 1303 · Helios 44-2 58mm f/2 · 28 px radius.** Focus stays on the airborne player while the trees recede into the lens blur.
+
+<p align="center"><a href="assets/forest-jump-source.jpg"><img src="assets/forest-jump-source.jpg" width="960" alt="Forest action frame before depth of field"></a><br><sub>Original frame</sub></p>
+
+<p align="center"><a href="assets/forest-jump-reverie.jpg"><img src="assets/forest-jump-reverie.jpg" width="960" alt="Forest action frame rendered with Reverie Helios lens preset"></a><br><sub>Reverie</sub></p>
+
+<details><summary>Show this frame's depth map</summary>
+
+<p align="center"><a href="assets/forest-jump-depth.png"><img src="assets/forest-jump-depth.png" width="960" alt="Depth map for the forest action frame"></a></p>
+
+</details>
+
+### Focus across the stairwell
+
+**Take 0016, frame 1470 · Sony 135mm STF (Apodized) · 18 px radius.** The nearby player remains defined while the room beyond the railing falls out of focus.
+
+<p align="center"><a href="assets/stairs-source.jpg"><img src="assets/stairs-source.jpg" width="960" alt="Stairwell frame before depth of field"></a><br><sub>Original frame</sub></p>
+
+<p align="center"><a href="assets/stairs-reverie.jpg"><img src="assets/stairs-reverie.jpg" width="960" alt="Stairwell frame rendered with Reverie Sony STF lens preset"></a><br><sub>Reverie</sub></p>
+
+<details><summary>Show this frame's depth map</summary>
+
+<p align="center"><a href="assets/stairs-depth.png"><img src="assets/stairs-depth.png" width="960" alt="Depth map for the stairwell frame"></a></p>
+
+</details>
+
 ## Start with the image
 
 | Goal | First move |
@@ -84,7 +116,7 @@ A single image cannot reveal what was hidden behind a foreground object. Reverie
 
 Download the [Windows release](https://github.com/zluxy/zlux.dof/releases/tag/v3.3.0). The ZIP includes `Reverie.aex`, `cudart64_12.dll` and an installer. Close After Effects, extract the ZIP and run `install-build.bat` as administrator. The installer backs up installed Reverie, Lensmith or zluxDOF binaries it replaces.
 
-To install manually, put `build_out/Reverie.aex` and `build_out/cudart64_12.dll` together in a MediaCore plugin folder, for example `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\Zlux\`. Restart AE and open **Effect → Zluxia → Reverie**. The standalone `.aex` is attached to the release if you already have the CUDA runtime. Without a compatible NVIDIA GPU, Reverie renders on the CPU.
+To install manually, put `build_out/Reverie.aex` and `build_out/cudart64_12.dll` together in `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\`. Restart AE and open **Effect → Zluxia → Reverie**. The standalone `.aex` is attached to the release if you already have the CUDA runtime. Without a compatible NVIDIA GPU, Reverie renders on the CPU.
 
 This build targets Windows x64, an AVX2-capable CPU and After Effects 2022 or newer. It has a new effect identity and control layout: add a fresh instance to existing projects. Old Lensmith and earlier Reverie instances are not migrated.
 
