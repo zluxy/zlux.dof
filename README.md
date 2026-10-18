@@ -6,7 +6,7 @@
 <p align="center"><strong>Depth of field with the character of a lens.</strong><br>For Adobe After Effects on Windows.</p>
 
 <p align="center">
-  <img alt="Version 3.3 dev10" src="https://img.shields.io/badge/version-3.3%20dev10-3366aa?style=flat-square">
+  <img alt="Version 3.3.0" src="https://img.shields.io/badge/version-3.3.0-3366aa?style=flat-square">
   <img alt="After Effects 2022 or newer" src="https://img.shields.io/badge/After%20Effects-2022%2B-6e5db8?style=flat-square">
   <img alt="Windows x64" src="https://img.shields.io/badge/Windows-x64-58697b?style=flat-square">
   <img alt="CUDA and CPU renderers" src="https://img.shields.io/badge/renderer-CUDA%20%2F%20CPU-3f8c6a?style=flat-square">
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zluxy/zlux.dof/releases/tag/v3.3.0-dev10"><strong>Download</strong></a> ·
+  <a href="https://github.com/zluxy/zlux.dof/releases/tag/v3.3.0"><strong>Download</strong></a> ·
   <a href="#start-with-the-image">Quick start</a> ·
   <a href="#one-real-test-frame">Example</a> ·
   <a href="#the-numbers">Test results</a> ·
@@ -31,11 +31,15 @@ You can get started with just the radius. When you want to go further, there are
 
 ## One real test frame
 
-This is the CS:GO frame used to check the dev10 Highlights fix. Both images come from the same source; the right frame was rendered by Reverie with its depth map. Click either image to inspect it at full size.
+This CS:GO frame was used to check the Highlights fix. Both images come from the same source; the second frame was rendered by Reverie with its depth map. Click either image to inspect it at full size.
 
-| Original frame | Reverie 3.3 dev10 |
-| :---: | :---: |
-| [![Original CS:GO frame](assets/csgo-original.png)](assets/csgo-original.png) | [![CS:GO frame rendered through Reverie](assets/csgo-reverie.png)](assets/csgo-reverie.png) |
+### Original frame
+
+<p align="center"><a href="assets/csgo-original.png"><img src="assets/csgo-original.png" width="960" alt="Original CS:GO frame"></a></p>
+
+### Reverie 3.3.0
+
+<p align="center"><a href="assets/csgo-reverie.png"><img src="assets/csgo-reverie.png" width="960" alt="CS:GO frame rendered through Reverie"></a></p>
 
 <details>
 <summary>Show the depth layer used for this frame</summary>
@@ -62,14 +66,7 @@ For grayscale depth, point focus is the quickest route. For an EXR Z pass, first
 
 ## The numbers
 
-These are dev10 native test-host results. They exercise the image-processing paths; they do not claim full compatibility with every After Effects version or timeline setup.
-
-```mermaid
-pie showData
-    title Dev10 native coverage: 94 visible functional controls
-    "Render controls exercised" : 91
-    "AE-only custom UI surfaces" : 3
-```
+These native test-host results exercise the image-processing paths; they do not claim full compatibility with every After Effects version or timeline setup.
 
 | Check | Result |
 | --- | ---: |
@@ -77,7 +74,7 @@ pie showData
 | CPU / CUDA render comparisons | **90 / 90** within test tolerance |
 | Directed lens-preset switches | **0 settings leaks in 1,936** checks |
 
-Dev10 fixes Highlights controls that appeared active but did not change the frame as intended. **Bokeh Brightness Boost** and **Bokeh Gamma** now affect selected out-of-focus highlights. Tint and saturation work without Boost. Threshold endpoints, procedural iris obstruction and Smart Render data handling received fixes too.
+This release fixes Highlights controls that appeared active but did not change the frame as intended. **Bokeh Brightness Boost** and **Bokeh Gamma** now affect selected out-of-focus highlights. Tint and saturation work without Boost. Threshold endpoints, procedural iris obstruction and Smart Render data handling received fixes too.
 
 ## Where depth still needs care
 
@@ -85,7 +82,7 @@ A single image cannot reveal what was hidden behind a foreground object. Reverie
 
 ## Installation
 
-Download the [Windows release](https://github.com/zluxy/zlux.dof/releases/tag/v3.3.0-dev10). The ZIP includes `Reverie.aex`, `cudart64_12.dll` and an installer. Close After Effects, extract the ZIP and run `install-build.bat` as administrator. The installer backs up installed Reverie, Lensmith or zluxDOF binaries it replaces.
+Download the [Windows release](https://github.com/zluxy/zlux.dof/releases/tag/v3.3.0). The ZIP includes `Reverie.aex`, `cudart64_12.dll` and an installer. Close After Effects, extract the ZIP and run `install-build.bat` as administrator. The installer backs up installed Reverie, Lensmith or zluxDOF binaries it replaces.
 
 To install manually, put `build_out/Reverie.aex` and `build_out/cudart64_12.dll` together in a MediaCore plugin folder, for example `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\Zlux\`. Restart AE and open **Effect → Zluxia → Reverie**. The standalone `.aex` is attached to the release if you already have the CUDA runtime. Without a compatible NVIDIA GPU, Reverie renders on the CPU.
 
